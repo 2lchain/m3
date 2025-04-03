@@ -280,6 +280,59 @@ test "lwstbitset" {
     try testing.expectEqual(4, lowestSetBit(u8, 0xf0));
 }
 
+const ExpandedImm = struct { val: u32, carry: bool };
+
+fn thumbExpandImmC(bits: u12, carry: bool) ExpandedImm {
+    const a = @as(packed struct(u12) { //
+        _7_0: u8,
+        _9_8: u2,
+        _11_10: u2,
+    }, @bitCast(bits));
+
+    if (a._11_10 == 0) {
+        return switch (a._9_8) {
+            0b00 => .{ .carry = carry, .val = a._7_0 },
+            0b01 => .{ //
+                .carry = carry,
+                .val = (@as(u32, a._7_0) << 16) | @as(u32, a._7_0),
+            },
+            0b10 => .{ //
+                .carry = carry,
+                .val = (@as(u32, a._7_0) << 24) | (@as(u32, a._7_0) << 8),
+            },
+            0b11 => .{ //
+                .carry = carry,
+                .val = (@as(u32, a._7_0) << 24) | (@as(u32, a._7_0) << 16) | (@as(u32, a._7_0) << 8) | @as(u32, a._7_0),
+            },
+        };
+    } else {
+        const res = rorc32(a._7_0 | 128, @intCast(bits >> 7));
+        return .{ .carry = res.carry, .val = res.value };
+    }
+}
+
+test "thumbExpandImm" {
+    const T = packed struct(u12) { //
+        _7_0: u8,
+        _9_8: u2,
+        _11_10: u2,
+    };
+
+    var a = T{ ._9_8 = 0, ._7_0 = 0xff, ._11_10 = 0 };
+    try testing.expect(thumbExpandImmC(@bitCast(a), false).val == 0xff);
+    a._9_8 = 1;
+    try testing.expect(thumbExpandImmC(@bitCast(a), false).val == 0xff00ff);
+    a._9_8 = 2;
+    try testing.expect(thumbExpandImmC(@bitCast(a), false).val == 0xff00ff00);
+    a._9_8 = 3;
+    try testing.expect(thumbExpandImmC(@bitCast(a), false).val == 0xffffffff);
+    a._9_8 = 0;
+    a._11_10 = 1;
+    a._7_0 = 0;
+    try testing.expect(thumbExpandImmC(@bitCast(a), false).val == 0x8000_0000);
+    try testing.expect(thumbExpandImmC(@bitCast(a), false).carry);
+}
+
 const Cpu = struct {
     const Mode = enum { thread, handler };
 
@@ -403,6 +456,8 @@ const Cpu = struct {
     const SP_MAIN = 13;
     const SP_PROC = 15;
 
+    const SP_REG = 13;
+
     const CONTROL = packed struct(u32) { //
         zero: bool = false,
         one: bool = false,
@@ -471,6 +526,10 @@ const Cpu = struct {
         };
     }
 
+    fn thumbExpandImm(self: *Cpu, bits: u12) u32 {
+        return thumbExpandImmC(bits, self.psr.c).val;
+    }
+
     fn conditionPassed(self: *Cpu) bool {
         const cond = currentCondition();
         const res = switch (cond >> 1) {
@@ -489,7 +548,7 @@ const Cpu = struct {
         return res;
     }
 
-    fn lookUpSp(self: *const Cpu) usize {
+    fn _lookUpSp(self: *const Cpu) usize {
         if (self.control.one) {
             if (self.mode == .thread) return 15;
             return SP_PROC;
@@ -501,14 +560,14 @@ const Cpu = struct {
         std.debug.assert(n <= 15);
         //if(n <= 15) return self.regs[n];
         if (n == 15) return self.getPC();
-        if (n == 13) return self.regs[self.lookUpSp()];
+        if (n == 13) return self.regs[self._lookUpSp()];
         return self.regs[n];
     }
 
     fn setReg(self: *Cpu, n: usize, value: u32) void {
         std.debug.assert(n <= 14);
         if (n == 13) {
-            self.regs[self.lookUpSp()] = value;
+            self.regs[self._lookUpSp()] = value;
         } else {
             self.regs[n] = value;
         }
@@ -638,7 +697,7 @@ const Cpu = struct {
     fn addspimmT1(self: *Cpu) void {
         if (self.conditionPassed()) {
             const a = @as(packed struct(u16) { imm: u8, d: u3, r: u5 }, @bitCast(@as(u16, @truncate(self.decoder.current))));
-            const r = addWithCarry32(self.getReg(self.lookUpSp()), (@as(u32, a.imm) << 2), false);
+            const r = addWithCarry32(self.getReg(SP_REG), (@as(u32, a.imm) << 2), false);
             self.setReg(a.d, r.v);
         }
     }
@@ -696,8 +755,7 @@ const Cpu = struct {
         if (self.conditionPassed()) {
             const a = @as(packed struct(u16) { d: u3, m: u3, imm: u5, r: u5 }, @bitCast(@as(u16, @truncate(self.decoder.current))));
             if (a.imm == 0) {
-                //TODO
-                unreachable;
+                return self.movregT2();
             }
             const r = shiftc32(self.getReg(a.m), .lsl, @intCast(a.imm), self.psr.c);
             self.setReg(a.d, r.value);
@@ -1028,6 +1086,21 @@ const Cpu = struct {
         }
     }
 
+    fn movregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u8) { d: u3, m: u3, D: u2 }, @bitCast(@as(u8, @truncate(self.decoder.current))));
+            const d = a.d;
+            const r = self.getReg(a.m);
+            if (d == 15) {
+                self.aluWritePc(r);
+            } else {
+                self.setReg(d, r);
+                self.psr.n = r & 0x8000_0000 != 0;
+                self.psr.z = r == 0;
+            }
+        }
+    }
+
     fn movregT1(self: *Cpu) void {
         if (self.conditionPassed()) {
             const a = @as(packed struct(u8) { d: u3, m: u4, D: u1 }, @bitCast(@as(u8, @truncate(self.decoder.current))));
@@ -1074,7 +1147,7 @@ const Cpu = struct {
             const n = d;
             if (d == 0b1101 or a.m == 0b1101) {
                 //TODO
-                unreachable;
+                return self.addspregT2();
             }
             const res = addWithCarry32(self.getReg(n), self.getReg(a.m), false);
             if (d == 15) {
@@ -1244,12 +1317,12 @@ const Cpu = struct {
     fn popT1(self: *Cpu) void {
         if (self.conditionPassed()) {
             var a: u8 = @truncate(self.decoder.current);
-            const address = self.getReg(self.lookUpSp());
+            const address = self.getReg(SP_REG);
             const sp = address + ((if (self.decoder.current & 256 > 0)
                 bitCount(u8, a) + 1
             else
                 bitCount(u8, a)) * 4);
-            var addr = self.getReg(self.lookUpSp());
+            var addr = self.getReg(SP_REG);
             for (0..8) |i| {
                 if (a & 1 > 0) {
                     self.setReg(i, self.readMemA(u32, addr));
@@ -1261,8 +1334,8 @@ const Cpu = struct {
                 self.loadWritePC(self.readMemA(u32, addr));
                 addr += 4;
             }
-            self.setReg(self.lookUpSp(), sp);
-            std.debug.assert(addr == self.getReg(self.lookUpSp()));
+            self.setReg(SP_REG, sp);
+            std.debug.assert(addr == self.getReg(SP_REG));
         }
     }
 
@@ -1299,7 +1372,7 @@ const Cpu = struct {
     fn pushT1(self: *Cpu) void {
         if (self.conditionPassed()) {
             var a: u8 = @truncate(self.decoder.current);
-            const address = self.getReg(self.lookUpSp());
+            const address = self.getReg(SP_REG);
             var addr = address - ((if (self.decoder.current & 256 > 0)
                 bitCount(u8, a) + 1
             else
@@ -1316,8 +1389,8 @@ const Cpu = struct {
                 self.writeMemA(u32, addr, self.getReg(14));
                 addr += 4;
             }
-            std.debug.assert(addr == self.getReg(self.lookUpSp()));
-            self.setReg(self.lookUpSp(), sp);
+            std.debug.assert(addr == self.getReg(SP_REG));
+            self.setReg(SP_REG, sp);
         }
     }
 
@@ -1376,6 +1449,10 @@ const Cpu = struct {
     }
 
     fn itinstr(self: *Cpu) void {
+        if (@as(u4, @truncate(self.decoder.current)) == 0) {
+            //TODO
+            unreachable;
+        }
         self.psr.setIT(@truncate(self.decoder.current));
     }
 
@@ -1405,9 +1482,487 @@ const Cpu = struct {
         }
     }
 
+    fn addspregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u8) { bits: u3, rm: u4, bit: u1 }, @bitCast(@as(u8, @truncate(self.decoder.current))));
+            std.debug.assert(a.bit == 1 and a.bits == 0b101);
+            const d = 13;
+            //(@as(u32, a.DM) << 3) | a.dm;
+
+            const res = addWithCarry32(self.getReg(SP_REG), self.getReg(a.rm), false);
+            self.setReg(d, res.v);
+        }
+    }
+
+    fn addspregT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u8) { dm: u3, bits: u4, bit: u1 }, @bitCast(@as(u8, @truncate(self.decoder.current))));
+            std.debug.assert(a.bits == 0b1101);
+            const d = (@as(u32, a.DM) << 3) | a.dm;
+            const m = d;
+
+            const res = addWithCarry32(self.getReg(SP_REG), self.getReg(m), false);
+
+            if (d == 15) {
+                self.aluWritePc(res.v);
+            } else {
+                self.setReg(d, res.v);
+            }
+        }
+    }
+
+    fn andimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rd == 0b1111 and a.s) {
+                // TODO goto tstimm
+                return self.tstimmT1();
+            } else {
+                const exp = thumbExpandImmC((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)), self.psr.c);
+                const result = self.getReg(a.rn) & exp.val;
+                self.setReg(a.rd, result);
+                if (a.s) {
+                    self.psr.n = result & 0x8000_0000 != 0;
+                    self.psr.z = result == 0;
+                    self.psr.c = exp.carry;
+                }
+            }
+        }
+    }
+
+    fn tstimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+            const exp = thumbExpandImmC((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)), self.psr.c);
+            const result = self.getReg(a.rn) & exp.val;
+            self.psr.n = result & 0x8000_0000 != 0;
+            self.psr.z = result == 0;
+            self.psr.c = exp.carry;
+        }
+    }
+
+    fn bicimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+            const exp = thumbExpandImmC((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)), self.psr.c);
+            const result = self.getReg(a.rn) & ~exp.val;
+            self.setReg(a.rd, result);
+            if (a.s) {
+                self.psr.n = result & 0x8000_0000 != 0;
+                self.psr.z = result == 0;
+                self.psr.c = exp.carry;
+            }
+        }
+    }
+
+    fn orrimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+            const exp = thumbExpandImmC((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)), self.psr.c);
+            const result = self.getReg(a.rn) | exp.val;
+            self.setReg(a.rd, result);
+            if (a.s) {
+                self.psr.n = result & 0x8000_0000 != 0;
+                self.psr.z = result == 0;
+                self.psr.c = exp.carry;
+            }
+        }
+    }
+
+    fn movimmT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+            const exp = thumbExpandImmC((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)), self.psr.c);
+            const result = exp.val;
+            self.setReg(a.rd, result);
+            if (a.s) {
+                self.psr.n = result & 0x8000_0000 != 0;
+                self.psr.z = result == 0;
+                self.psr.c = exp.carry;
+            }
+        }
+    }
+
+    fn mvnimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+            const exp = thumbExpandImmC((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)), self.psr.c);
+            const result = ~exp.val;
+            self.setReg(a.rd, result);
+            if (a.s) {
+                self.psr.n = result & 0x8000_0000 != 0;
+                self.psr.z = result == 0;
+                self.psr.c = exp.carry;
+            }
+        }
+    }
+
+    fn ornimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rd == 0b1111) {
+                // TODO goto tstimm
+                return self.mvnimmT1();
+            } else {
+                const exp = thumbExpandImmC((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)), self.psr.c);
+                const result = self.getReg(a.rn) & exp.val;
+                self.setReg(a.rd, result);
+                if (a.s) {
+                    self.psr.n = result & 0x8000_0000 != 0;
+                    self.psr.z = result == 0;
+                    self.psr.c = exp.carry;
+                }
+            }
+        }
+    }
+
+    fn teqimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+            const exp = thumbExpandImmC((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)), self.psr.c);
+            const result = self.getReg(a.rn) ^ exp.val;
+            self.psr.n = result & 0x8000_0000 != 0;
+            self.psr.z = result == 0;
+            self.psr.c = exp.carry;
+        }
+    }
+
+    fn eorimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rd == 0b1111 and a.s) {
+                // TODO goto tstimm
+                return self.teqimmT1();
+            } else {
+                const exp = thumbExpandImmC((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)), self.psr.c);
+                const result = self.getReg(a.rn) ^ exp.val;
+                self.setReg(a.rd, result);
+                if (a.s) {
+                    self.psr.n = result & 0x8000_0000 != 0;
+                    self.psr.z = result == 0;
+                    self.psr.c = exp.carry;
+                }
+            }
+        }
+    }
+
+    fn cmnimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+            const exp = self.thumbExpandImm((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)));
+            const result = addWithCarry32(self.getReg(a.rn), exp, false);
+            self.psr.n = result.v & 0x8000_0000 != 0;
+            self.psr.z = result.v == 0;
+            self.psr.c = result.carry_out;
+            self.psr.v = result.overflow;
+        }
+    }
+
+    fn addimmT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rd == 0b1111 and a.s) return self.cmnimmT1();
+
+            if (a.rn == 0b1101) {
+                //TODO
+                unreachable;
+            }
+
+            const exp = self.thumbExpandImm((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)));
+            const result = addWithCarry32(self.getReg(a.rn), exp, false);
+            self.setReg(a.rd, result.v);
+            if (a.s) {
+                self.psr.n = result.v & 0x8000_0000 != 0;
+                self.psr.z = result.v == 0;
+                self.psr.c = result.carry_out;
+                self.psr.v = result.overflow;
+            }
+        }
+    }
+
+    fn adcimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            const exp = self.thumbExpandImm((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)));
+            const result = addWithCarry32(self.getReg(a.rn), exp, self.psr.c);
+            self.setReg(a.rd, result.v);
+            if (a.s) {
+                self.psr.n = result.v & 0x8000_0000 != 0;
+                self.psr.z = result.v == 0;
+                self.psr.c = result.carry_out;
+                self.psr.v = result.overflow;
+            }
+        }
+    }
+
+    fn sbcimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+            const exp = self.thumbExpandImm((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)));
+            const result = addWithCarry32(self.getReg(a.rn), ~exp, self.psr.c);
+            self.setReg(a.rd, result.v);
+            if (a.s) {
+                self.psr.n = result.v & 0x8000_0000 != 0;
+                self.psr.z = result.v == 0;
+                self.psr.c = result.carry_out;
+                self.psr.v = result.overflow;
+            }
+        }
+    }
+
+    fn cmpimmT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+            const exp = self.thumbExpandImm((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)));
+            const result = addWithCarry32(self.getReg(a.rn), ~exp, true);
+
+            self.psr.n = result.v & 0x8000_0000 != 0;
+            self.psr.z = result.v == 0;
+            self.psr.c = result.carry_out;
+            self.psr.v = result.overflow;
+        }
+    }
+
+    fn subimmT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rd == 0b1111) return self.cmpimmT2();
+
+            if (a.rn == 0b1101) {
+                //TODO
+                unreachable;
+            }
+
+            const exp = self.thumbExpandImm((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)));
+            const result = addWithCarry32(self.getReg(a.rn), ~exp, true);
+            self.setReg(a.rd, result.v);
+            if (a.s) {
+                self.psr.n = result.v & 0x8000_0000 != 0;
+                self.psr.z = result.v == 0;
+                self.psr.c = result.carry_out;
+                self.psr.v = result.overflow;
+            }
+        }
+    }
+
+    fn rsbimmT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            const exp = self.thumbExpandImm((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)));
+            const result = addWithCarry32(~self.getReg(a.rn), exp, true);
+            self.setReg(a.rd, result.v);
+            if (a.s) {
+                self.psr.n = result.v & 0x8000_0000 != 0;
+                self.psr.z = result.v == 0;
+                self.psr.c = result.carry_out;
+                self.psr.v = result.overflow;
+            }
+        }
+    }
+
     fn exec(self: *Cpu, instr: Instr) void {
         std.debug.print("instr: {}\n", .{instr});
         switch (instr) {
+            .rsbimmT2 => self.rsbimmT2(),
+            .cmpimmT2 => self.cmpimmT2(),
+            .subimmT3 => self.subimmT3(),
+            .sbcimmT1 => self.sbcimmT1(),
+            .adcimmT1 => self.adcimmT1(),
+            .addimmT3 => self.addimmT3(),
+            .cmnimmT1 => self.cmnimmT1(),
+            .eorimmT1 => self.eorimmT1(),
+            .teqimmT1 => self.teqimmT1(),
+            .ornimmT1 => self.ornimmT1(),
+            .mvnimmT1 => self.mvnimmT1(),
+            .movimmT2 => self.movimmT2(),
+            .orrimmT1 => self.orrimmT1(),
+            .bicimmT1 => self.bicimmT1(),
+            .tstimmT1 => self.tstimmT1(),
+            .andimmT1 => self.andimmT1(),
+            //====================
             .ldmT1 => self.ldmT1(),
             .stmT1 => self.stmT1(),
             .addspimmT1 => self.addspimmT1(),
@@ -1508,9 +2063,9 @@ pub const Instr = enum { //
     it,
     undefined,
     svc,
+    // TODO
     bT1,
     bT2,
-    bT3,
     cps,
     addspimmT2,
     subspimmT1,
@@ -1541,7 +2096,6 @@ pub const Instr = enum { //
     strimmT2,
     ldrimmT2,
     addregT2,
-    unpredictable,
 
     cmpregT2,
     //cmpregT1,
@@ -1584,6 +2138,135 @@ pub const Instr = enum { //
     addspimmT1,
     stmT1,
     ldmT1,
+
+    //32 bit
+    andimmT1,
+    tstimmT1,
+    bicimmT1,
+    movimmT2,
+    orrimmT1,
+    mvnimmT1,
+    ornimmT1,
+    teqimmT1,
+    eorimmT1,
+    cmnimmT1,
+    addimmT3,
+    adcimmT1,
+    sbcimmT1,
+    cmpimmT2,
+    subimmT3,
+    rsbimmT2,
+    //======
+    adrT3,
+    addimmT4,
+    movimmT3,
+    adrT2,
+    subimmT4,
+    movtT1,
+    sbfxT1,
+    bfcT1,
+    bfiT1,
+    ubfxT1,
+    ssatT1,
+    usatT1,
+
+    bT3,
+    bT4,
+    mrsT1,
+    msrT1,
+    blT1,
+
+    nopT2,
+    yieldT2,
+    wfeT2,
+    wfiT2,
+    sevT2,
+    dbgT1,
+
+    clrexT1,
+    dsbT1,
+    dmbT1,
+    isbT1,
+
+    stmT2,
+    popT2,
+    ldmT2,
+    ldmdbT1,
+    pushT2,
+    stmdbT1,
+
+    strdimmT1,
+    ldrdimmT1,
+    strexT1,
+    ldrexT1,
+    strexbT1,
+    strexhT1,
+    tbbT1,
+    ldrexbT1,
+    ldrexhT1,
+
+    ldrimmT3,
+    ldrimmT4,
+    ldrtT1,
+    ldrregT2,
+    ldrlitT2,
+
+    ldrhimmT2,
+    ldrhimmT3,
+    ldrhtT1,
+    ldrhlitT1,
+    ldrhregT2,
+    ldrshimmT1,
+    ldrshimmT2,
+    ldrshtT1,
+    ldrshlitT1,
+    ldrshregT2,
+
+    ldrbimmT2,
+    ldrbimmT3,
+    ldrbtT1,
+    ldrblitT1,
+    ldrbregT2,
+    ldrsbimmT1,
+    ldrsbT2,
+    ldrsbtT1,
+    ldrsblitT1,
+    ldrsbregT2,
+    pldimmT1,
+
+    strbimmT3,
+    strbregT2,
+    strbimmT2,
+    strhimmT2,
+    strhimmT3,
+    strhregT2,
+    strimmT3,
+    strimmT4,
+    strregT2,
+
+    tstregT2,
+    unpredictable,
+    andregT2,
+    bicregT2,
+    orrregT2,
+    mvnregT2,
+    ornregT1,
+    tegregT1,
+    eorregT2,
+    cmnregT2,
+    addregT3,
+    adcregT2,
+    sbcregT2,
+    cmpregT3,
+    subregT2,
+    rsbregT1,
+
+    movregT3,
+    lslimmT2,
+    lsrimmT2,
+    asrimmT2,
+    rrxT1,
+    rorimmT1,
 };
 
 pub const Decoder = struct {
@@ -1616,10 +2299,431 @@ pub const Decoder = struct {
         return try self.stream.reader().readInt(u16, self.endian);
     }
 
+    fn dataProcModimm32(w: u32) Instr {
+        const a = @as(packed struct(u32) { //
+            _1: u8,
+            rd: u4,
+            _2: u4,
+            rn: u4,
+            op: u5,
+            _3: u7,
+        }, @bitCast(w));
+
+        switch (a.op >> 1) {
+            0 => return switch (a.rd) {
+                0b1111 => .tstimmT1,
+                else => .andimmT1,
+            },
+            1 => return .bicimmT1,
+            2 => return switch (a.rn) {
+                0b1111 => .movimmT2,
+                else => .orrimmT1,
+            },
+            3 => return switch (a.rn) {
+                0b1111 => .mvnimmT1,
+                else => .ornimmT1,
+            },
+            4 => return switch (a.rd) {
+                0b1111 => .teqimmT1,
+                else => .eorimmT1,
+            },
+            8 => return switch (a.rd) {
+                0b1111 => .cmnimmT1,
+                else => .addimmT3,
+            },
+            0b1010 => return .adcimmT1,
+            0b1011 => return .sbcimmT1,
+            0b1101 => return switch (a.rd) {
+                0b1111 => .cmpimmT2,
+                else => .subimmT3,
+            },
+            0b1110 => return .rsbimmT2,
+            else => return .unknown,
+        }
+    }
+
+    fn dataProcPB32(w: u32) Instr {
+        const a = @as(packed struct(u32) { //
+            _1: u16,
+            rn: u4,
+            op: u5,
+            _3: u7,
+        }, @bitCast(w));
+
+        switch (a.op) {
+            0 => return switch (a.rn) {
+                0b1111 => .adrT3,
+                else => .addimmT4,
+            },
+            0b100 => return .movimmT3,
+            0b1010 => return switch (a.rn) {
+                0b1111 => .adrT2,
+                else => .subimmT4,
+            },
+            0b1100 => return .movtT1,
+            0b10100 => return .sbfxT1,
+            0b10110 => return switch (a.rn) {
+                0b1111 => .bfcT1,
+                else => .bfiT1,
+            },
+            0b11100 => return .ubfxT1,
+            else => {
+                if (a.op >> 2 == 0b100 and a.op & 1 == 0) return .ssatT1;
+                if (a.op >> 2 == 0b110 and a.op & 1 == 0) return .usatT1;
+                unreachable;
+            },
+        }
+
+        return .unknown;
+    }
+
+    fn hintIntrs(w: u32) Instr {
+        const a = @as(packed struct(u32) { //
+            op2: u8,
+            op1: u3,
+            _1: u21,
+        }, @bitCast(w));
+
+        if (a.op1 != 0) return .undefined;
+
+        return switch (a.op2) {
+            0 => .nopT2,
+            1 => .yieldT2,
+            2 => .wfeT2,
+            3 => .wfiT2,
+            4 => .sevT2,
+            else => if (a.op2 >> 4 == 0xf) .dbgT1 else unreachable,
+        };
+    }
+
+    fn miscCtlInstrs(w: u32) Instr {
+        const op = (w >> 4) & 0b1111;
+        return switch (op) {
+            0b10 => .clrexT1,
+            0b100 => .dsbT1,
+            0b101 => .dmbT1,
+            0b110 => .isbT1,
+            else => unreachable,
+        };
+    }
+
+    fn branchMiscCtl32(w: u32) Instr {
+        const a = @as(packed struct(u32) { //
+            _1: u12,
+            op2: u3,
+            _2: u1,
+            _3: u4,
+            op1: u7,
+            _4: u5,
+        }, @bitCast(w));
+
+        switch (a.op2) {
+            0 => {
+                if (a.op1 & 0b0111000 != 0b0111000) return .bT3;
+                if (a.op1 >> 1 == 0b011100) return .msrT1;
+                //TODO
+                if (a.op1 == 0b0111010) return hintIntrs(w);
+                //TODO
+                if (a.op1 == 0b0111011) return miscCtlInstrs(w);
+
+                if (a.op1 >> 1 == 0b11111) return .mrsT1;
+            },
+            else => {
+                if (a.op2 == 0b10 and a.op1 == 0b1111111) return .undefined;
+                if (a.op2 & 1 == 1 and a.op2 & 0b100 == 0) return .bT4;
+                if (a.op2 & 1 == 0 and a.op2 & 0b100 == 0b100) return .undefined;
+                if (a.op2 & 1 == 1 and a.op2 & 0b100 == 0b100) return .blT1;
+                unreachable;
+            },
+        }
+
+        return .unknown;
+    }
+
+    fn loadStoreMult32(word: u16) Instr {
+        const l = (word >> 4) & 1;
+        const wrn = (@as(u8, @truncate((word >> 5) & 1)) << 5) | @as(u8, @truncate(word & 0b1111));
+        const op = (word >> 7) & 0b11;
+
+        switch (op) {
+            0b01 => {
+                if (l == 0) return .stmT2;
+                if (l == 1 and wrn == 0b11101) return .popT2;
+                return .ldmT2;
+            },
+            0b10 => {
+                if (l == 1) return .ldmdbT1;
+                if (l == 0 and wrn == 0b11101) return .pushT2;
+                return .stmdbT1;
+            },
+            else => unreachable,
+        }
+    }
+
+    fn loadStoredualxt32(w: u32) Instr {
+        const a = @as(packed struct(u32) { //
+            _1: u4,
+            op3: u4,
+            _2: u8,
+            //===
+            rn: u4,
+            op2: u2,
+            _3: u1,
+            op1: u2,
+            _4: u7,
+        }, @bitCast(w));
+
+        if ((a.op1 >> 1 == 0 and a.op2 == 0b10) or
+            (a.op1 >> 1 == 1 and a.op2 & 1 == 0))
+            return .strdimmT1;
+
+        if ((a.op1 >> 1 == 0 and a.op2 == 0b11) or
+            (a.op1 >> 1 == 1 and a.op2 & 1 == 1))
+            return .ldrdimmT1;
+
+        switch (a.op1) {
+            0 => return if (a.op2 == 0) .strexT1 else .ldrexT1,
+            1 => return switch (a.op2) {
+                0 => switch (a.op3) {
+                    0b100 => .strexbT1,
+                    0b101 => .strexhT1,
+                    else => unreachable,
+                },
+                1 => switch (a.op3) {
+                    0, 1 => .tbbT1,
+                    0b100 => .ldrexbT1,
+                    0b101 => .ldrexhT1,
+                    else => unreachable,
+                },
+                else => unreachable,
+            },
+            else => unreachable,
+        }
+    }
+
+    fn loadword32(w: u32) Instr {
+        const a = @as(packed struct(u32) { //
+            _1: u6,
+            op2: u6,
+            _2: u4,
+            //===
+            rn: u4,
+            _3: u3,
+            op1: u2,
+            _4: u7,
+        }, @bitCast(w));
+
+        if (a.op1 & 0b10 == 0 and a.rn == 0xf) return .ldrlitT2;
+
+        switch (a.op1) {
+            1 => if (a.rn != 0b1111) return .ldrimmT3 else unreachable,
+            0 => {
+                if (a.op2 & 0b100 != 0 and a.op2 & 0b100000 != 0 and a.rn != 0xf) return .ldrimmT4;
+                if (a.op2 >> 2 == 0b1100 and a.rn != 0xf) return .ldrimmT4;
+                if (a.op2 >> 2 == 0b1110 and a.rn != 0xf) return .ldrtT1;
+                if (a.op2 == 0 and a.rn != 0xf) return .ldrregT2;
+                unreachable;
+            },
+            else => unreachable,
+        }
+    }
+
+    fn loadhalf32(w: u32) Instr {
+        const a = @as(packed struct(u32) { //
+            _1: u6,
+            op2: u6,
+            rt: u4,
+            //===
+            rn: u4,
+            _3: u3,
+            op1: u2,
+            _4: u7,
+        }, @bitCast(w));
+
+        if (a.op1 == 1 and a.rn != 0xf and a.rt != 0xf) return .ldrhimmT2;
+        if (a.op1 == 0 and a.op2 & 0b100000 != 0 and a.op2 & 0b100 != 0 and a.rn != 0xf and a.rt != 0xf) return .ldrhimmT3;
+        if (a.op1 == 0 and a.op2 >> 2 == 0b1100 and a.rn != 0xf and a.rt != 0xf) return .ldrhimmT3;
+        if (a.op1 == 0 and a.op2 >> 2 == 0b1110 and a.rn != 0xf and a.rt != 0xf) return .ldrhtT1;
+        if (a.op1 & 0b10 == 0 and a.rn == 0xf and a.rt != 0xf) return .ldrhlitT1;
+        if (a.op1 == 0 and a.op2 == 0b0 and a.rn != 0xf and a.rt != 0xf) return .ldrhregT2;
+
+        if (a.op1 == 0b11 and a.rn != 0xf and a.rt != 0xf) return .ldrshimmT1;
+        if (a.op1 == 0b10 and a.op2 & 0b100000 != 0 and a.op2 & 0b100 != 0 and a.rn != 0xf and a.rt != 0xf) return .ldrshimmT2;
+        if (a.op1 == 0b10 and a.op2 >> 2 == 0b1100 and a.rn != 0xf and a.rt != 0xf) return .ldrshimmT2;
+        if (a.op1 == 0b10 and a.op2 >> 2 == 0b1110 and a.rn != 0xf and a.rt != 0xf) return .ldrshtT1;
+
+        if (a.op1 & 0b10 != 0 and a.rn == 0xf and a.rt != 0xf) return .ldrshlitT1;
+        if (a.op1 == 0b10 and a.op2 == 0 and a.rn != 0xf and a.rt != 0xf) return .ldrshregT2;
+
+        if (a.rt == 0xf) return .nop;
+
+        unreachable;
+    }
+
+    fn loadByteMemHints32(w: u32) Instr {
+        const a = @as(packed struct(u32) { //
+            _1: u6,
+            op2: u6,
+            rt: u4,
+            //===
+            rn: u4,
+            _3: u3,
+            op1: u2,
+            _4: u7,
+        }, @bitCast(w));
+
+        if (a.op1 == 1 and a.rt != 0xf and a.rn != 0xf) return .ldrbimmT2;
+        if (a.op1 == 0 and a.op2 & 0b100000 != 0 and a.op2 & 0b100 != 0 and a.rn != 0xf and a.rt != 0xf) return .ldrbimmT3;
+        if (a.op1 == 0 and a.op2 >> 2 == 0b1100 and a.rn != 0xf and a.rt != 0xf) return .ldrbimmT3;
+
+        if (a.op1 == 0 and a.op2 >> 2 == 0b1110 and a.rn != 0xf) return .ldrbtT1;
+
+        if (a.op1 & 0b10 == 0 and a.rn == 0xf and a.rt != 0xf) return .ldrblitT1;
+
+        if (a.op1 == 0 and a.op2 == 0 and a.rn != 0xf and a.rt != 0xf) return .ldrbregT2;
+
+        if (a.op1 == 0b11 and a.rt != 0xf and a.rn != 0xf) return .ldrsbimmT1;
+        if (a.op1 == 0b10 and a.op2 & 0b100000 != 0 and a.op2 & 0b100 != 0 and a.rn != 0xf and a.rt != 0xf) return .ldrsbT2;
+        if (a.op1 == 0b10 and a.op2 >> 2 == 0b1100 and a.rn != 0xf and a.rt != 0xf) return .ldrsbT2;
+
+        if (a.op1 == 0b10 and a.op2 >> 2 == 0b1110 and a.rn != 0xf) return .ldrsbtT1;
+
+        if (a.op1 & 0b10 != 0 and a.rn == 0xf and a.rt != 0xf) return .ldrsblitT1;
+
+        if (a.op1 == 0b10 and a.op2 == 0 and a.rn != 0xf and a.rt != 0xf) return .ldrsbregT2;
+
+        if ((a.op1 == 1 and a.rn != 0xf and a.rt == 0xf) or
+            (a.op1 == 0 and a.op2 >> 2 == 0b1100 and a.rn != 0xf and a.rt == 0xf) or
+            (a.op1 & 0b10 == 0 and a.rn == 0xf and a.rt == 0xf) or
+            (a.op1 == 0 and a.op2 == 0 and a.rn != 0xf and a.rt == 0xf) or
+            (a.op1 == 0b11 and a.rn != 0xf and a.rt == 0xf) or
+            (a.op1 == 0b10 and a.op2 >> 2 == 0b1100 and a.rn != 0xf and a.rt == 0xf) or
+            (a.op1 & 0b10 != 0 and a.rn == 0xf and a.rt == 0xf) or
+            (a.op1 == 0b10 and a.op2 == 0 and a.rn != 0xf and a.rt == 0xf))
+            //idc
+            return .pldimmT1;
+
+        unreachable;
+    }
+
+    fn storeSingle32(w: u32) Instr {
+        const a = @as(packed struct(u32) { //
+            _1: u6,
+            op2: u6,
+            _2: u4,
+            //===
+            _3: u5,
+            op1: u3,
+            _4: u8,
+        }, @bitCast(w));
+
+        return switch (a.op1) {
+            0 => if (a.op2 & 0b100000 != 0) .strbimmT3 else .strbregT2,
+            0b100 => .strbimmT2,
+            0b101 => .strhimmT2,
+            0b1 => if (a.op2 & 0b100000 != 0) .strhimmT3 else .strhregT2,
+            0b110 => .strimmT3,
+            0b10 => if (a.op2 & 0b100000 != 0) .strimmT4 else .strregT2,
+            else => unreachable,
+        };
+    }
+
+    fn dataProcShiftedReg(w: u32) Instr {
+        const a = @as(packed struct(u32) { //
+            _1: u8,
+            rd: u4,
+            _2: u4,
+            //===
+            rn: u4,
+            s: bool,
+            op: u4,
+            _3: u7,
+        }, @bitCast(w));
+
+        return switch (a.op) {
+            0 => switch (a.rd) {
+                0b1111 => if (a.s) .tstregT2 else .unpredictable,
+                else => .andregT2,
+            },
+            1 => .bicregT2,
+            0b10 => switch (a.rn) {
+                0xf => block: {
+                    //Move register and immediate shifts on pageA5-27
+                    const b = @as(packed struct(u32) { //
+                        _1: u4,
+                        type: u2,
+                        imm2: u2,
+                        _2: u4,
+                        imm3: u3,
+                        //===
+                        _3: u17,
+                    }, @bitCast(w));
+
+                    break :block switch (b.type) {
+                        0 => if (b.imm3 == 0 and b.imm2 == 0) .movregT3 else .lslimmT2,
+                        1 => .lsrimmT2,
+                        2 => .asrimmT2,
+                        3 => if (b.imm3 == 0 and b.imm2 == 0) .rrxT1 else .rorimmT1,
+                    };
+                },
+                else => .orrregT2,
+            },
+            0b11 => switch (a.rn) {
+                0xf => .mvnregT2,
+                else => .ornregT1,
+            },
+            0b100 => switch (a.rd) {
+                0xf => if (a.s) .tegregT1 else .unpredictable,
+                else => .eorregT2,
+            },
+            0b1000 => switch (a.rd) {
+                0xf => if (a.s) .cmnregT2 else .unpredictable,
+                else => .addregT3,
+            },
+            0b1010 => .adcregT2,
+            0b1011 => .sbcregT2,
+            0b1101 => switch (a.rd) {
+                0xf => if (a.s) .cmpregT3 else .unpredictable,
+                else => .subregT2,
+            },
+            0b1110 => .rsbregT1,
+            else => unreachable,
+        };
+    }
+
+    fn instr32(self: *Decoder, wh: u16) Instr {
+        const wl = @as(u32, self.getWord() catch unreachable);
+        self.current = (@as(u32, wh) << 16) | wl;
+        if (wh >> 11 == 0b11110 and wh & 0b1000000000 == 0 and wl & 0x8000 == 0) {
+            return dataProcModimm32(self.current);
+        } else if (wh >> 11 == 0b11110 and wh & 0b1000000000 != 0 and wl & 0x8000 == 0) {
+            return dataProcPB32(self.current);
+        } else if (wh >> 11 == 0b11110 and wl & 0x8000 != 0) {
+            return branchMiscCtl32(self.current);
+        } else if (wh >> 9 == 0b1110100 and wh & 0b1000_000 == 0) {
+            return loadStoreMult32(wh);
+        } else if (wh >> 9 == 0b1110100 and wh & 0b1000_000 != 0) {
+            return loadStoredualxt32(self.current);
+        } else if (wh >> 9 == 0b1111100 and wh & 0b1000_000 != 0 and wh & 0b10000 != 0) {
+            return loadword32(self.current);
+        } else if (wh >> 9 == 0b1111100 and ((wh >> 4) & 0b111) == 0b11) {
+            return loadhalf32(self.current);
+        } else if (wh >> 9 == 0b1111100 and ((wh >> 4) & 0b111) == 0b01) {
+            return loadByteMemHints32(self.current);
+        } else if (wh >> 8 == 0b11111000 and wh & 0b10000 == 0) {
+            return storeSingle32(self.current);
+        } else if (wh >> 9 == 0b111_0101) {
+            return dataProcShiftedReg(self.current);
+        }
+        return .unknown;
+    }
+
     pub fn decode(self: *Decoder) !Instr {
         const word = try self.getWord();
-        if (is32bit(word)) @panic("32 bits not handled");
-        std.debug.print("seq: {b} {b}\n", .{ word, word >> 10 });
+        std.debug.print("seq: {b}\n", .{word});
+        if (is32bit(word)) {
+            return self.instr32(word);
+        }
 
         self.current = @intCast(word);
         self.current_instr = if (word >> 12 == 0b1011)
@@ -1637,6 +2741,8 @@ pub const Decoder = struct {
 
         return self.current_instr;
     }
+
+    //0 1 0 0 0 1 0 0
 
     fn shaddsubmovcmp(word: u16) Instr {
         const opcode = (word >> 9) & 0b11111;
