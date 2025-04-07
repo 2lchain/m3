@@ -62,7 +62,7 @@ fn decodeRegShift(t: u2) SRType {
 
 const ShiftRes = struct { value: u32, carry: bool };
 
-fn shiftc32(value: u32, t: SRType, amount: u6, carry: bool) ShiftRes {
+fn shiftc32(value: u32, t: SRType, amount: u8, carry: bool) ShiftRes {
     std.debug.assert(!(t == .rrx and amount != 1));
     if (amount == 0) return .{ .value = value, .carry = carry };
     return switch (t) {
@@ -75,19 +75,20 @@ fn shiftc32(value: u32, t: SRType, amount: u6, carry: bool) ShiftRes {
     };
 }
 
-fn shift32(value: u32, t: SRType, amount: u6, carry: bool) u32 {
+fn shift32(value: u32, t: SRType, amount: u8, carry: bool) u32 {
     // TODO allow overflow
     return shiftc32(value, t, amount, carry).value;
 }
 
-fn lslc32(value: u32, n: u6) ShiftRes {
+fn lslc32(value: u32, n: u8) ShiftRes {
     std.debug.assert(n > 0);
-    const res = @as(u64, @intCast(value)) << (n - 1);
+    //const res = @as(u64, @intCast(value)) << (n - 1);
+    const res = std.math.shl(u32, value, n - 1);
     const c = res & 0x80000000 > 0;
-    return .{ .value = @truncate(res << 1), .carry = c };
+    return .{ .value = res << 1, .carry = c };
 }
 
-fn lsl32(value: u32, n: u6) u32 {
+fn lsl32(value: u32, n: u8) u32 {
     if (n == 0) return value;
     return lslc32(value, n).value;
 }
@@ -98,14 +99,15 @@ test "lsl" {
     try testing.expectEqual(lslc32(1, 31), ShiftRes{ .carry = false, .value = 0x80000000 });
 }
 
-fn lsrc32(value: u32, n: u6) ShiftRes {
+fn lsrc32(value: u32, n: u8) ShiftRes {
     std.debug.assert(n > 0);
-    const res = @as(u64, @intCast(value)) >> (n - 1);
+    //const res = @as(u64, @intCast(value)) >> (n - 1);
+    const res = std.math.shr(u32, value, n - 1);
     const c = res & 1 > 0;
-    return .{ .value = @truncate(res >> 1), .carry = c };
+    return .{ .value = res >> 1, .carry = c };
 }
 
-fn lsr32(value: u32, n: u6) u32 {
+fn lsr32(value: u32, n: u8) u32 {
     if (n == 0) return value;
     return lsrc32(value, n).value;
 }
@@ -116,15 +118,15 @@ test "lsr" {
     try testing.expectEqual(lsrc32(0x80000001, 32), ShiftRes{ .carry = true, .value = 0b0 });
 }
 
-fn asrc32(value: u32, n: u6) ShiftRes {
+fn asrc32(value: u32, n: u8) ShiftRes {
     std.debug.assert(n > 0);
     var res: i64 = @intCast(@as(i32, @bitCast(value)));
-    res >>= (n - 1);
+    res >>= (@truncate(n - 1));
     const c = res & 1 > 0;
     return .{ .value = @bitCast(@as(i32, @truncate(res >> 1))), .carry = c };
 }
 
-fn asr32(value: u32, n: u6) u32 {
+fn asr32(value: u32, n: u8) u32 {
     if (n == 0) return value;
     return asrc32(value, n).value;
 }
@@ -137,14 +139,15 @@ test "asr" {
     try testing.expectEqual(asrc32(0x80000001, 32), ShiftRes{ .carry = true, .value = 0xffff_ffff });
 }
 
-fn rorc32(value: u32, n: u6) ShiftRes {
+fn rorc32(value: u32, n: u8) ShiftRes {
     std.debug.assert(n != 0);
-    const m = n % 32;
-    const a = lsrc32(value, m).value | lslc32(value, 32 - m).value;
+    const a = std.math.rotr(u32, value, n);
+    //const m = n % 32;
+    //lsrc32(value, m).value | lslc32(value, 32 - m).value;
     return .{ .carry = a & 0x80000000 > 0, .value = a };
 }
 
-fn ror32(value: u32, n: u6) u32 {
+fn ror32(value: u32, n: u8) u32 {
     if (n == 0) return value;
     return rorc32(value, n).value;
 }
@@ -170,27 +173,73 @@ test "rrx" {
     try testing.expectEqual(rrxc32(1, true), ShiftRes{ .carry = true, .value = 0x80000000 });
     try testing.expectEqual(rrxc32(1, false), ShiftRes{ .carry = true, .value = 0x0 });
 }
-pub fn mairn() !void {
-    // const neg: i5 = -1;
-    //const a: u32 = 0x80000000;
-    // const n = addWithCarry32(127, 0, true);
-    std.debug.print("res: {}\n", .{unsignedSat32(0)});
+
+const uSAT = struct { result: u32, saturated: bool };
+const sSAT = struct { result: i32, saturated: bool };
+
+fn signedSatQ(ii: i32, n: u32) sSAT {
+    const i: i64 = @intCast(ii);
+    const pow = std.math.pow(i64, 2, @intCast(n - 1));
+    return if (i > (pow - 1))
+        sSAT{ //
+            .result = @truncate(pow - 1),
+            .saturated = true,
+        }
+    else if (i < -(pow))
+        sSAT{ //
+            .result = @truncate(-pow),
+            .saturated = true,
+        }
+    else
+        sSAT{ //
+            .result = @bitCast(ii),
+            .saturated = false,
+        };
 }
 
-const SAT = struct { value: u32, sat: bool };
-
-fn signedSat32(a: u32) bool {
-    const i = @as(i32, @bitCast(a));
-    return i >= std.math.maxInt(i32) or i <= std.math.minInt(i32);
+fn unsignedSatQ(ii: u32, n: u32) uSAT {
+    const i: u64 = @intCast(ii);
+    const pow = std.math.pow(u64, 2, @intCast(n)) - 1;
+    return if (i > (pow)) //
+        uSAT{ //
+            .result = @truncate(pow),
+            .saturated = true,
+        }
+    else if (i < 0) //
+        unreachable
+        //uSAT{ //
+        //    .result = 0,
+        //    .saturated = true,
+        //}
+    else
+        uSAT{ //
+            .result = @bitCast(ii),
+            .saturated = false,
+        };
 }
 
-fn unsignedSat32(a: u32) bool {
-    return a >= std.math.maxInt(u32) or a <= 0;
+fn signedSat(a: i32, n: u8) i32 {
+    return signedSatQ(a, n).result;
 }
 
-fn sat32(a: u32, sign: bool) bool {
-    if (sign) return signedSat32(a);
-    return unsignedSat32(a);
+fn unsignedSat(a: u32, n: u8) u32 {
+    return unsignedSatQ(a, n).result;
+}
+
+test "satt" {
+    try testing.expect(signedSat(1, 1) == 0);
+    try testing.expect(signedSat(1, 2) == 1);
+    try testing.expect(signedSat(12888, 8) == 127);
+    try testing.expect(signedSat(-567, 8) == -128);
+    try testing.expect(signedSat(std.math.minInt(i32), 8) == -128);
+    try testing.expect(signedSat(std.math.maxInt(i32), 8) == 127);
+
+    try testing.expect(signedSat(std.math.minInt(i32), 32) == std.math.minInt(i32));
+    try testing.expect(signedSat(std.math.maxInt(i32), 32) == std.math.maxInt(i32));
+
+    try testing.expect(unsignedSat(260, 8) == 255);
+    try testing.expect(unsignedSat(260, 3) == 7);
+    try testing.expect(unsignedSat(std.math.maxInt(u32), 32) == std.math.maxInt(u32));
 }
 
 const ADC = struct { carry_out: bool, overflow: bool, v: u32 };
@@ -331,6 +380,57 @@ test "thumbExpandImm" {
     a._7_0 = 0;
     try testing.expect(thumbExpandImmC(@bitCast(a), false).val == 0x8000_0000);
     try testing.expect(thumbExpandImmC(@bitCast(a), false).carry);
+}
+
+inline fn onemask(n: u6) u32 {
+    return std.math.shl(u32, 0xffff_ffff, n);
+}
+
+inline fn zeromask(n: u6) u32 {
+    return std.math.shr(u32, 0xffff_ffff, n);
+}
+
+fn signExtend(a: u32, n: u6) u32 {
+    std.debug.assert(n != 0);
+    const signed = a & (@as(u32, 1) << @truncate(n - 1)) != 0;
+    if (signed) {
+        return a | onemask(@truncate(n));
+    }
+    return a & zeromask(@truncate(32 - n));
+}
+
+test "sextend" {
+    try testing.expect(signExtend(1, 1) == 0xffff_ffff);
+    try testing.expect(signExtend(1, 2) == 1);
+    try testing.expect(signExtend(16, 5) == 0xffff_fff0);
+    try testing.expect(signExtend(16, 6) == 16);
+}
+
+fn copyBits(to: u32, to_begin: u6, from: u32, from_begin: u6, width: u6) u32 {
+    const src_bits = std.math.shl(u32, (std.math.shr(u32, from, from_begin) & zeromask(32 - width)), to_begin);
+    const to_top = to & onemask(to_begin + width);
+    const to_bottom = to & zeromask(32 - to_begin);
+    return to_top | src_bits | to_bottom;
+}
+
+test "copy bits" {
+    try testing.expectEqual(copyBits(0, 0, 0xf, 0, 4), 0xf);
+    try testing.expectEqual(copyBits(0xf000_0000, 0, 0xf, 0, 4), 0xf000_000f);
+    try testing.expectEqual(copyBits(0xf000_00fe, 0, 0xf, 0, 1), 0xf000_00ff);
+    try testing.expectEqual(copyBits(0x7000_0000, 31, 0x1, 0, 1), 0xf000_0000);
+    try testing.expectEqual(copyBits(0xffff_efff, 12, 0x1, 0, 1), 0xffff_ffff);
+    try testing.expectEqual(copyBits(0xffff_ffff, 12, 0x0, 0, 4), 0xffff_0fff);
+}
+
+fn extractBits(from: u32, msbit: u6, lsbit: u6) u32 {
+    return std.math.shr(u32, from, lsbit) & zeromask(32 - ((msbit - lsbit) + 1));
+}
+
+test "extract bit" {
+    try testing.expect(extractBits(1, 0, 0) == 1);
+    try testing.expect(extractBits(0b1100, 3, 2) == 0b11);
+    try testing.expect(extractBits(0xf000_0000, 31, 28) == 0b1111);
+    try testing.expect(extractBits(0xf000_0000, 31, 29) == 0b111);
 }
 
 const Cpu = struct {
@@ -518,6 +618,17 @@ const Cpu = struct {
         self.decoder = try Decoder.init(elf_header.entry, elf_header.endian, self.memory[0..]);
     }
 
+    fn exclusiveMonitorsPass(self: *Cpu) bool {
+        _ = self;
+        return true;
+    }
+
+    fn setExclusiveMonitors(self: *Cpu, address: u32, n: u32) void {
+        _ = address;
+        _ = n;
+        _ = self;
+    }
+
     fn currentCondition() u4 {
         return switch (cpu.decoder.current_instr) {
             .bT1 => return @truncate(((cpu.decoder.current >> 8) & 0b1111)),
@@ -654,6 +765,32 @@ const Cpu = struct {
         self.mem_steam.writer().writeInt(T, val, .big) catch unreachable;
     }
 
+    fn readMemA_Unpriv(self: *Cpu, T: type, addr: usize) T {
+        if (addr % @sizeOf(T) != 0) @panic("unaligned mem access!!");
+        self.mem_steam.seekTo(addr) catch unreachable;
+        //TODO check endian
+        return self.mem_steam.reader().readInt(T, .big) catch unreachable;
+    }
+
+    fn writeMemA_Unpriv(self: *Cpu, T: type, addr: usize, val: T) void {
+        if (addr % @sizeOf(T) != 0) @panic("unaligned mem access!!");
+        self.mem_steam.seekTo(addr) catch unreachable;
+        //TODO check endian
+        self.mem_steam.writer().writeInt(T, val, .big) catch unreachable;
+    }
+
+    fn readMemU_Unpriv(self: *Cpu, T: type, addr: usize) T {
+        self.mem_steam.seekTo(addr) catch unreachable;
+        //TODO check endian
+        return self.mem_steam.reader().readInt(T, .big) catch unreachable;
+    }
+
+    fn writeMemU_Unpriv(self: *Cpu, T: type, addr: usize, val: T) void {
+        self.mem_steam.seekTo(addr) catch unreachable;
+        //TODO check endian
+        self.mem_steam.writer().writeInt(T, val, .big) catch unreachable;
+    }
+
     fn ldmT1(self: *Cpu) void {
         if (self.conditionPassed()) {
             const a = @as(packed struct(u16) { imm: u8, n: u3, r: u5 }, @bitCast(@as(u16, @truncate(self.decoder.current))));
@@ -705,7 +842,7 @@ const Cpu = struct {
     fn adrT1(self: *Cpu) void {
         if (self.conditionPassed()) {
             const a = @as(packed struct(u16) { imm: u8, d: u3, r: u5 }, @bitCast(@as(u16, @truncate(self.decoder.current))));
-            const r = std.mem.alignForward(u32, self.getPC(), 4) + (@as(u32, a.imm) << 2);
+            const r = std.mem.alignBackward(u32, self.getPC(), 4) + (@as(u32, a.imm) << 2);
             self.setReg(a.d, r);
         }
     }
@@ -713,7 +850,7 @@ const Cpu = struct {
     fn ldrlitT1(self: *Cpu) void {
         if (self.conditionPassed()) {
             const a = @as(packed struct(u16) { imm: u8, t: u3, r: u5 }, @bitCast(@as(u16, @truncate(self.decoder.current))));
-            const addr = std.mem.alignForward(u32, self.getPC(), 4) + (@as(u32, a.imm) << 2);
+            const addr = std.mem.alignBackward(u32, self.getPC(), 4) + (@as(u32, a.imm) << 2);
             const data = self.readMemU(u32, addr);
             if (a.t == 15) {
                 if (addr & 1 == 0) {
@@ -1373,21 +1510,21 @@ const Cpu = struct {
         if (self.conditionPassed()) {
             var a: u8 = @truncate(self.decoder.current);
             const address = self.getReg(SP_REG);
-            var addr = address - ((if (self.decoder.current & 256 > 0)
+            var addr = @subWithOverflow(address, ((if (self.decoder.current & 256 > 0)
                 bitCount(u8, a) + 1
             else
-                bitCount(u8, a)) * 4);
+                bitCount(u8, a)) * 4))[0];
             const sp = addr;
             for (0..8) |i| {
                 if (a & 1 > 0) {
                     self.writeMemA(u32, addr, self.getReg(i));
-                    addr += 4;
+                    addr = @addWithOverflow(addr, 4)[0];
                 }
                 a >>= 1;
             }
             if (self.decoder.current & 256 > 0) {
                 self.writeMemA(u32, addr, self.getReg(14));
-                addr += 4;
+                addr = @addWithOverflow(addr, 4)[0];
             }
             std.debug.assert(addr == self.getReg(SP_REG));
             self.setReg(SP_REG, sp);
@@ -1510,7 +1647,7 @@ const Cpu = struct {
             }
         }
     }
-
+    //===
     fn andimmT1(self: *Cpu) void {
         if (self.conditionPassed()) {
             const a = @as(packed struct(u32) { //
@@ -1943,9 +2080,2512 @@ const Cpu = struct {
         }
     }
 
+    fn addimmT4(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                _2: u6,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rn == 0xf) {
+                unreachable; //TODO
+            }
+
+            if (a.rn == 0b1101) {
+                unreachable; //TODO
+            }
+
+            const exp: u32 = (@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8));
+            const d = a.rd;
+            const n = a.rn;
+
+            const res = addWithCarry32(self.getReg(n), exp, false);
+            self.setReg(d, res.v);
+        }
+    }
+
+    fn adrT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                _2: u6,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            const imm32: u32 = (@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8));
+
+            self.setReg(a.rd, @subWithOverflow(std.mem.alignBackward(u32, self.getPC(), 4), imm32)[0]);
+        }
+    }
+
+    fn adrT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                _2: u6,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            const imm32: u32 = (@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8));
+
+            self.setReg(a.rd, @addWithOverflow(std.mem.alignBackward(u32, self.getPC(), 4), imm32)[0]);
+        }
+    }
+
+    fn movimmT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            const exp = thumbExpandImmC((@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8)), self.psr.c);
+
+            self.setReg(a.rd, exp.val);
+
+            if (a.s) {
+                self.psr.n = exp.val & 0x8000_0000 != 0;
+                self.psr.z = exp.val == 0;
+                self.psr.c = exp.carry;
+            }
+        }
+    }
+
+    fn subimmT4(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                rn: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rd == 0b1111) {
+                unreachable; //TODO
+            }
+
+            if (a.rn == 0b1101) {
+                unreachable; //TODO
+            }
+
+            const exp = (@as(u12, a.i) << 11) | (@as(u12, a.imm3) << 8) | (@as(u12, a.imm8));
+            const result = addWithCarry32(self.getReg(a.rn), ~exp, true);
+            self.setReg(a.rd, result.v);
+        }
+    }
+
+    fn movtT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                imm3: u3,
+                _1: u1,
+                //half 2
+                imm4: u4,
+                s: bool,
+                _2: u5,
+                i: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            const imm16 = (@as(u16, a.imm4) << 12) | (@as(u16, a.i) << 11) | (@as(u16, a.imm3) << 8) | (@as(u16, a.imm8));
+            const res = self.getReg(a.rd) & 0xffff;
+            self.setReg(a.rd, res | (@as(u32, imm16) << 16));
+        }
+    }
+
+    fn ssatT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                sat_imm: u5,
+                _1: u1,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _2: u1,
+                //====
+                rn: u4,
+                _3: u1,
+                sh: u1,
+                _4: u10,
+            }, @bitCast(self.decoder.current));
+
+            const imm3_2 = (@as(u5, a.imm3) << 2) | a.imm2;
+
+            if (a.sh == 1 and imm3_2 == 0) {
+                return self.undefined();
+            }
+
+            const saturate_to = @as(u32, a.sat_imm) + 1;
+            const shft = decodeImmShift(@as(u2, a.sh) << 1, imm3_2);
+
+            const op = shift32(self.getReg(a.rn), shft.t, @truncate(shft.n), self.psr.c);
+
+            const res = signedSatQ(@bitCast(op), saturate_to);
+
+            self.setReg(a.rd, @bitCast(res.result));
+
+            if (res.saturated) {
+                self.psr.q = true;
+            }
+        }
+    }
+
+    fn @"undefined"(self: *Cpu) void {
+        _ = self;
+        unreachable;
+    }
+
+    fn sbfxT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                widthm1: u5,
+                _1: u1,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _2: u1,
+                //====
+                rn: u4,
+                _3: u1,
+                sh: u1,
+                _4: u10,
+            }, @bitCast(self.decoder.current));
+
+            const lsbit = (@as(u5, a.imm3) << 2) | a.imm2;
+
+            const msbit: u8 = lsbit + a.widthm1;
+
+            if (msbit <= 31) {
+                self.setReg(a.rd, signExtend(self.getReg(a.rn) >> lsbit, msbit));
+            }
+        }
+    }
+
+    fn bfiT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                msb: u5,
+                _1: u1,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _2: u1,
+                //====
+                rn: u4,
+                _3: u1,
+                sh: u1,
+                _4: u10,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rn == 0xf) {
+                return self.bfcT1();
+            }
+
+            const lsbit = (@as(u5, a.imm3) << 2) | a.imm2;
+
+            const msbit: u5 = a.msb;
+
+            if (msbit >= lsbit) {
+                const res = copyBits(self.getReg(a.rd), lsbit, self.getReg(a.rn), 0, msbit - lsbit);
+                self.setReg(a.rd, res);
+            }
+        }
+    }
+
+    fn bfcT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                msb: u5,
+                _1: u1,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _2: u1,
+                //====
+                rn: u4,
+                _3: u1,
+                sh: u1,
+                _4: u10,
+            }, @bitCast(self.decoder.current));
+
+            const lsbit = (@as(u5, a.imm3) << 2) | a.imm2;
+
+            const msbit: u5 = a.msb;
+
+            if (msbit >= lsbit) {
+                const res = copyBits(self.getReg(a.rd), lsbit, 0, 0, msbit - lsbit);
+                self.setReg(a.rd, res);
+            }
+        }
+    }
+
+    fn usatT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                sat_imm: u5,
+                _1: u1,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _2: u1,
+                //====
+                rn: u4,
+                _3: u1,
+                sh: u1,
+                _4: u10,
+            }, @bitCast(self.decoder.current));
+
+            const imm3_2 = (@as(u5, a.imm3) << 2) | a.imm2;
+
+            if (a.sh == 1 and imm3_2 == 0) {
+                return self.undefined();
+            }
+
+            const saturate_to = @as(u32, a.sat_imm);
+            const shft = decodeImmShift(@as(u2, a.sh) << 1, imm3_2);
+
+            const op = shift32(self.getReg(a.rn), shft.t, @truncate(shft.n), self.psr.c);
+
+            const res = unsignedSatQ(@bitCast(op), saturate_to);
+
+            self.setReg(a.rd, @bitCast(res.result));
+
+            if (res.saturated) {
+                self.psr.q = true;
+            }
+        }
+    }
+
+    fn ubfxT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                widthm1: u5,
+                _1: u1,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _2: u1,
+                //====
+                rn: u4,
+                _3: u1,
+                sh: u1,
+                _4: u10,
+            }, @bitCast(self.decoder.current));
+
+            const lsbit = (@as(u5, a.imm3) << 2) | a.imm2;
+
+            const msbit: u6 = lsbit + a.widthm1;
+
+            if (msbit <= 31) {
+                self.setReg(a.rd, extractBits(self.getReg(a.rn), msbit, lsbit));
+            }
+        }
+    }
+
+    fn bT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm11: u11,
+                j2: u1,
+                _1: u1,
+                j1: u1,
+                _2: u2,
+                //====
+                imm6: u6,
+                cond: u4,
+                s: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            if (a.cond >> 1 == 0b111) unreachable; //TODO
+
+            const imm32: i21 = @bitCast((@as(u21, (@as(u3, a.s) << 2) | (@as(u3, a.j2) << 1) | @as(u3, a.j1)) << 18) | (@as(u21, a.imm6) << 12) | (@as(u21, a.imm11) << 1));
+
+            self.branchWritePC(@addWithOverflow(self.getPC(), @as(u32, @bitCast(@as(i32, imm32))))[0]);
+        }
+    }
+
+    fn bT4(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm11: u11,
+                j2: u1,
+                _1: u1,
+                j1: u1,
+                _2: u2,
+                //====
+                imm10: u10,
+                s: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            const i1_ = ~(a.j1 ^ a.s);
+            const i2_ = ~(a.j2 ^ a.s);
+
+            const imm32: i25 = @bitCast((@as(u25, (@as(u3, a.s) << 2) | (@as(u3, i1_) << 1) | @as(u3, i2_)) << 22) | (@as(u25, a.imm10) << 12) | (@as(u25, a.imm11) << 1));
+
+            self.branchWritePC(@addWithOverflow(self.getPC(), @as(u32, @bitCast(@as(i32, imm32))))[0]);
+        }
+    }
+
+    fn msrT1(self: *Cpu) void {
+        _ = self;
+        unreachable;
+    }
+
+    fn mrsT1(self: *Cpu) void {
+        _ = self;
+        unreachable;
+    }
+
+    fn blT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm11: u11,
+                j2: u1,
+                _1: u1,
+                j1: u1,
+                _2: u2,
+                //====
+                imm10: u10,
+                s: u1,
+                _3: u5,
+            }, @bitCast(self.decoder.current));
+
+            const i1_ = ~(a.j1 ^ a.s);
+            const i2_ = ~(a.j2 ^ a.s);
+
+            const imm32: i25 = @bitCast((@as(u25, (@as(u3, a.s) << 2) | (@as(u3, i1_) << 1) | @as(u3, i2_)) << 22) | (@as(u25, a.imm10) << 12) | (@as(u25, a.imm11) << 1));
+
+            self.setRL(self.getPC() | 1);
+
+            self.branchWritePC(@addWithOverflow(self.getPC(), @as(u32, @bitCast(@as(i32, imm32))))[0]);
+        }
+    }
+
+    fn nop(self: *Cpu) void {
+        _ = self;
+    }
+
+    fn yield(self: *Cpu) void {
+        _ = self;
+    }
+
+    fn wfe(self: *Cpu) void {
+        _ = self;
+    }
+
+    fn wfi(self: *Cpu) void {
+        _ = self;
+    }
+
+    fn sev(self: *Cpu) void {
+        _ = self;
+    }
+
+    fn dbg(self: *Cpu) void {
+        _ = self;
+    }
+
+    fn clrex(self: *Cpu) void {
+        _ = self;
+    }
+
+    fn dsb(self: *Cpu) void {
+        _ = self;
+    }
+
+    fn dmb(self: *Cpu) void {
+        _ = self;
+    }
+
+    fn isb(self: *Cpu) void {
+        _ = self;
+    }
+
+    fn stmT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                register_list: u13,
+                _1: u1,
+                M: bool,
+                _2: u1,
+                //====
+                rn: u4,
+                _3: u1,
+                W: bool,
+                _4: u10,
+            }, @bitCast(self.decoder.current));
+
+            var registers: u16 = a.register_list;
+            if (a.M) registers |= (1 << 14);
+
+            //var bc:usize = 0;
+            const n = a.rn;
+
+            var address = self.getReg(n);
+
+            for (0..15) |i| {
+                if (registers & 1 > 0) {
+                    self.writeMemA(u32, address, self.getReg(i));
+                    address = @addWithOverflow(address, 4)[0];
+                    //bc+=1;
+                }
+                registers >>= 1;
+            }
+
+            if (a.W) {
+                self.setReg(n, address);
+            }
+        }
+    }
+
+    fn ldmT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                register_list: u13,
+                _1: u1,
+                M: bool,
+                P: bool,
+                //====
+                rn: u4,
+                _3: u1,
+                W: bool,
+                _4: u10,
+            }, @bitCast(self.decoder.current));
+
+            if (a.W and a.rn == 0b1101) unreachable; //TODO
+
+            var registers: u16 = a.register_list;
+            if (a.M) registers |= (1 << 14);
+            if (a.P) registers |= (1 << 15);
+
+            //var bc:usize = 0;
+            const n = a.rn;
+
+            var address = self.getReg(n);
+            var wb = false;
+            for (0..15) |i| {
+                if (registers & 1 > 0) {
+                    self.setReg(i, self.readMemA(u32, address));
+                    address = @addWithOverflow(address, 4)[0];
+                    //bc+=1;
+                } else {
+                    if (i == n) {
+                        wb = true;
+                    }
+                }
+                registers >>= 1;
+            }
+
+            if (registers & 1 > 0) {
+                self.loadWritePC(self.readMemA(u32, address));
+                address = @addWithOverflow(address, 4)[0];
+            } else {
+                if (n == 15) {
+                    wb = true;
+                }
+            }
+
+            if (a.W and wb) {
+                self.setReg(n, address);
+            }
+        }
+    }
+
+    fn popT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                register_list: u13,
+                _1: u1,
+                M: bool,
+                P: bool,
+                //====
+                _2: u16,
+            }, @bitCast(self.decoder.current));
+
+            var registers: u16 = a.register_list;
+            if (a.M) registers |= (1 << 14);
+            if (a.P) registers |= (1 << 15);
+
+            var address = self.getReg(SP_REG);
+
+            self.setReg(SP_REG, address + bitCount(u16, registers) * 4);
+
+            for (0..15) |i| {
+                if (registers & 1 > 0) {
+                    self.setReg(i, self.readMemA(u32, address));
+                    address = @addWithOverflow(address, 4)[0];
+                    //bc+=1;
+                }
+                registers >>= 1;
+            }
+
+            if (registers & 1 > 0) {
+                self.loadWritePC(self.readMemA(u32, address));
+            }
+
+            unreachable; //unaligned allowed = false
+        }
+    }
+
+    fn popT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                _1: u12,
+                rt: u4,
+                //====
+                _2: u16,
+            }, @bitCast(self.decoder.current));
+
+            const address = self.getReg(SP_REG);
+
+            self.setReg(SP_REG, address + 4);
+
+            if (a.rt == 15) {
+                self.loadWritePC(self.readMemA(u32, address));
+            } else {
+                self.setReg(a.rt, self.readMemA(u32, address));
+            }
+
+            unreachable; //unaligned allowed = true
+        }
+    }
+
+    fn stmdbT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                register_list: u13,
+                _1: u1,
+                M: bool,
+                P: bool,
+                //====
+                rn: u4,
+                _3: u1,
+                W: bool,
+                _4: u10,
+            }, @bitCast(self.decoder.current));
+
+            if (a.W and a.rn == 0b1101) unreachable; //TODO see push
+
+            var registers: u16 = a.register_list;
+            if (a.M) registers |= (1 << 14);
+
+            var address = @subWithOverflow(self.getReg(a.rn), (4 * bitCount(u16, registers)))[0];
+            const add = address;
+
+            for (0..15) |i| {
+                if (registers & 1 > 0) {
+                    self.writeMemA(u32, address, self.getReg(i));
+                    address = @addWithOverflow(address, 4)[0];
+                    //bc+=1;
+                }
+                registers >>= 1;
+            }
+
+            if (a.W) {
+                self.setReg(a.rn, add);
+            }
+        }
+    }
+
+    fn pushT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                register_list: u13,
+                _1: u1,
+                M: bool,
+                P: bool,
+                //====
+                _2: u16,
+            }, @bitCast(self.decoder.current));
+
+            var registers: u16 = a.register_list;
+            if (a.M) registers |= (1 << 14);
+
+            var address = @subWithOverflow(self.getReg(SP_REG), (4 * bitCount(u16, registers)))[0];
+            const add = address;
+
+            for (0..15) |i| {
+                if (registers & 1 > 0) {
+                    self.writeMemA(u32, address, self.getReg(i));
+                    address = @addWithOverflow(address, 4)[0];
+                    //bc+=1;
+                }
+                registers >>= 1;
+            }
+
+            self.setReg(SP_REG, add);
+        }
+    }
+
+    fn pushT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                _1: u12,
+                rt: u4,
+                //====
+                _2: u16,
+            }, @bitCast(self.decoder.current));
+
+            const address = @subWithOverflow(self.getReg(SP_REG), 4)[0];
+            self.writeMemA(u32, address, self.getReg(a.rt));
+            self.setReg(SP_REG, address);
+        }
+    }
+
+    fn ldmdbT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                register_list: u13,
+                _1: u1,
+                M: bool,
+                P: bool,
+                //====
+                rn: u4,
+                _3: u1,
+                W: bool,
+                _4: u10,
+            }, @bitCast(self.decoder.current));
+
+            var registers: u16 = a.register_list;
+            if (a.M) registers |= (1 << 14);
+
+            const n = a.rn;
+
+            var address = @subWithOverflow(self.getReg(n), (4 * bitCount(u16, registers)))[0];
+            const add = address;
+
+            var wb = false;
+            for (0..15) |i| {
+                if (registers & 1 > 0) {
+                    self.setReg(i, self.readMemA(u32, address));
+                    address = @addWithOverflow(address, 4)[0];
+                    //bc+=1;
+                } else {
+                    if (i == n) {
+                        wb = true;
+                    }
+                }
+                registers >>= 1;
+            }
+
+            if (registers & 1 > 0) {
+                self.loadWritePC(self.readMemA(u32, address));
+            } else {
+                if (n == 15) {
+                    wb = true;
+                }
+            }
+
+            if (a.W and wb) {
+                self.setReg(n, add);
+            }
+        }
+    }
+
+    fn strexT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const address = self.getReg(a.rn) + (a.imm8 << 2);
+
+            if (self.exclusiveMonitorsPass()) {
+                self.writeMemA(u32, address, self.getReg(a.rt));
+                self.setReg(a.rd, 1);
+            } else {
+                self.setReg(a.rd, 1);
+            }
+        }
+    }
+
+    fn ldrexT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const address = self.getReg(a.rn) + (a.imm8 << 2);
+
+            self.setExclusiveMonitors(address, 4);
+
+            self.setReg(a.rt, self.readMemA(u32, address));
+        }
+    }
+
+    fn strdimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rt2: u4,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u1,
+                W: bool,
+                _2: u1,
+                U: bool,
+                P: bool,
+                _3: u7,
+            }, @bitCast(self.decoder.current));
+
+            if (!a.P and !a.W) unreachable; //TODO
+
+            const index = a.P;
+            const add = a.U;
+            const wback = a.W;
+
+            const offset_addr = if (add) @addWithOverflow(self.getReg(a.rn), (a.imm8 << 2))[0] else //
+                @subWithOverflow(self.getReg(a.rn), (a.imm8 << 2))[0];
+
+            const addr = if (index) offset_addr else self.getReg(a.rn);
+
+            self.writeMemA(u32, addr, self.getReg(a.rt));
+            self.writeMemA(u32, @addWithOverflow(addr, 4)[0], self.getReg(a.rt2));
+
+            if (wback) self.setReg(a.rn, offset_addr);
+        }
+    }
+
+    fn ldrdimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rt2: u4,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u1,
+                W: bool,
+                _2: u1,
+                U: bool,
+                P: bool,
+                _3: u7,
+            }, @bitCast(self.decoder.current));
+
+            if (!a.P and !a.W) unreachable; //TODO
+
+            const index = a.P;
+            const add = a.U;
+            const wback = a.W;
+
+            const offset_addr = if (add) @addWithOverflow(self.getReg(a.rn), (a.imm8 << 2))[0] else //
+                @subWithOverflow(self.getReg(a.rn), (a.imm8 << 2))[0];
+
+            const addr = if (index) offset_addr else self.getReg(a.rn);
+
+            self.setReg(a.rt, self.readMemA(u32, addr));
+            self.setReg(a.rt2, self.readMemA(u32, @addWithOverflow(addr, 4)[0]));
+
+            if (wback) self.setReg(a.rn, offset_addr);
+        }
+    }
+
+    fn strexbT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const address = self.getReg(a.rn) + (a.imm8 << 2);
+
+            if (self.exclusiveMonitorsPass()) {
+                self.writeMemA(u8, address, @truncate(self.getReg(a.rt)));
+                self.setReg(a.rd, 0);
+            } else {
+                self.setReg(a.rd, 1);
+            }
+        }
+    }
+
+    fn strexhT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const address = self.getReg(a.rn) + (a.imm8 << 2);
+
+            if (self.exclusiveMonitorsPass()) {
+                self.writeMemA(u16, address, @truncate(self.getReg(a.rt)));
+                self.setReg(a.rd, 0);
+            } else {
+                self.setReg(a.rd, 1);
+            }
+        }
+    }
+
+    fn tbbT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                H: bool,
+                _1: u11,
+                //====
+                rn: u4,
+                _2: u12,
+            }, @bitCast(self.decoder.current));
+
+            const half_words = if (a.H)
+                self.readMemA(u16, self.getReg(a.rn + std.math.shl(u32, self.getReg(a.rm), 1)))
+            else
+                @as(u16, self.readMemA(u8, self.getReg(a.rn + self.getReg(a.rm))));
+
+            self.branchWritePC(self.getPC() + (2 * half_words));
+        }
+    }
+
+    fn ldrexbT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const address = self.getReg(a.rn);
+
+            self.setExclusiveMonitors(address, 1);
+
+            self.setReg(a.rt, self.readMemA(u8, address));
+        }
+    }
+
+    fn ldrexhT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                rd: u4,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const address = self.getReg(a.rn);
+
+            self.setExclusiveMonitors(address, 2);
+
+            self.setReg(a.rt, self.readMemA(u16, address));
+        }
+    }
+
+    fn ldrimmT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm12: u12,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rn == 0b1111) unreachable; //TODO
+
+            const addr = self.getReg(a.rn) + a.imm12;
+            const data = self.readMemU(u32, addr);
+            self.setReg(a.rn, addr);
+            if (a.rt == 15) {
+                if (addr & 0b11 == 0) {
+                    self.loadWritePC(data);
+                }
+            } else {
+                self.setReg(a.rt, data);
+            }
+        }
+    }
+
+    fn ldrimmT4(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                W: bool,
+                U: bool,
+                P: bool,
+                _1: u1,
+                rt: u4,
+                //====
+                rn: u4,
+                _2: u12,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rn == 0b1111) unreachable; //TODO
+
+            if (!a.P and !a.W) self.undefined();
+
+            const add = a.U;
+            const index = a.P;
+            const wback = a.W;
+
+            const offset_addr = if (add) self.getReg(a.rn) + a.imm8 else self.getReg(a.rn) - a.imm8;
+            const addr = if (index) offset_addr else self.getReg(a.rn);
+            const data = self.readMemU(u32, addr);
+            if (wback) self.setReg(a.rn, offset_addr);
+            if (a.rt == 15) {
+                if (addr & 0b11 == 0) {
+                    self.loadWritePC(data);
+                }
+            } else {
+                self.setReg(a.rt, data);
+            }
+        }
+    }
+
+    fn ldrregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                imm2: u2,
+                rd: u6,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const offset = shift32(self.getReg(a.rm), .lsl, a.imm2, self.psr.c);
+            const address = self.getReg(a.rn) + offset;
+            const data = self.readMemU(u32, address);
+
+            if (a.rt == 15) {
+                if (address & 0b11 == 0) {
+                    self.loadWritePC(data);
+                }
+            } else {
+                self.setReg(a.rt, data);
+            }
+        }
+    }
+
+    fn ldrlitT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm12: u12,
+                rt: u4,
+                //====
+                _2: u7,
+                U: bool,
+                _1: u8,
+            }, @bitCast(self.decoder.current));
+
+            const base = std.mem.alignBackward(u32, self.getPC(), 4);
+            const address = if (a.U) base + a.imm12 else base - a.imm12;
+            const data = self.readMemU(u32, address);
+
+            if (a.rt == 15) {
+                if (address & 0b11 == 0) {
+                    self.loadWritePC(data);
+                }
+            } else {
+                self.setReg(a.rt, data);
+            }
+        }
+    }
+
+    fn ldrhimmT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm12: u12,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+            const addr = self.getReg(a.rn) + a.imm12;
+            self.setReg(a.rt, self.readMemU(u16, addr));
+        }
+    }
+
+    fn ldrhimmT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                W: bool,
+                U: bool,
+                P: bool,
+                _1: u1,
+                rt: u4,
+                //====
+                rn: u4,
+                _2: u12,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rn == 0b1111) unreachable; //TODO
+
+            if (!a.P and !a.W) self.undefined();
+
+            const add = a.U;
+            const index = a.P;
+            const wback = a.W;
+
+            const offset_addr = if (add) self.getReg(a.rn) + a.imm8 else self.getReg(a.rn) - a.imm8;
+            const addr = if (index) offset_addr else self.getReg(a.rn);
+            const data = self.readMemU(u16, addr);
+            if (wback) self.setReg(a.rn, offset_addr);
+
+            self.setReg(a.rt, data);
+        }
+    }
+
+    fn ldrhtT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                W: bool,
+                U: bool,
+                P: bool,
+                _1: u1,
+                rt: u4,
+                //====
+                rn: u4,
+                _2: u12,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rn == 0b1111) unreachable; //TODO
+
+            const addr = self.getReg(a.rn) + a.imm8;
+            const data = self.readMemU_Unpriv(u16, addr);
+
+            self.setReg(a.rt, data);
+        }
+    }
+
+    fn ldrhlitT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm12: u12,
+                rt: u4,
+                //====
+                _0: u7,
+                U: bool,
+                _1: u8,
+            }, @bitCast(self.decoder.current));
+            const base = std.mem.alignBackward(u32, self.getPC(), 4);
+            const addr = if (a.U) base + a.imm12 else base + a.imm12;
+            self.setReg(a.rt, self.readMemU(u16, addr));
+        }
+    }
+
+    fn ldrhregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                imm2: u2,
+                rd: u6,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const offset = shift32(self.getReg(a.rm), .lsl, a.imm2, self.psr.c);
+            const address = self.getReg(a.rn) + offset;
+            const data = self.readMemU(u16, address);
+
+            self.setReg(a.rt, data);
+        }
+    }
+
+    fn ldrshimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                W: bool,
+                U: bool,
+                P: bool,
+                _1: u1,
+                rt: u4,
+                //====
+                rn: u4,
+                _2: u12,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rn == 0b1111) unreachable; //TODO
+
+            if (!a.P and !a.W) self.undefined();
+
+            const add = a.U;
+            const index = a.P;
+            const wback = a.W;
+
+            const offset_addr = if (add) self.getReg(a.rn) + a.imm8 else self.getReg(a.rn) - a.imm8;
+            const addr = if (index) offset_addr else self.getReg(a.rn);
+            const data = self.readMemU(u16, addr);
+            if (wback) self.setReg(a.rn, offset_addr);
+
+            self.setReg(a.rt, @bitCast(@as(i32, @as(i16, @bitCast(data)))));
+        }
+    }
+
+    fn ldrshtT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                W: bool,
+                U: bool,
+                P: bool,
+                _1: u1,
+                rt: u4,
+                //====
+                rn: u4,
+                _2: u12,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rn == 0b1111) unreachable; //TODO
+
+            const addr = self.getReg(a.rn) + a.imm8;
+            const data = self.readMemU_Unpriv(u16, addr);
+            self.setReg(a.rt, @bitCast(@as(i32, @as(i16, @bitCast(data)))));
+        }
+    }
+
+    fn ldrshlitT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm12: u12,
+                rt: u4,
+                //====
+                _0: u7,
+                U: bool,
+                _1: u8,
+            }, @bitCast(self.decoder.current));
+
+            const base = std.mem.alignBackward(u32, self.getPC(), 4);
+            const address = if (a.U) base + a.imm12 else base - a.imm12;
+            const data = self.readMemU(u16, address);
+
+            self.setReg(a.rt, @bitCast(@as(i32, @as(i16, @bitCast(data)))));
+        }
+    }
+
+    fn ldrshregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                imm2: u2,
+                rd: u6,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const offset = shift32(self.getReg(a.rm), .lsl, a.imm2, self.psr.c);
+            const address = self.getReg(a.rn) + offset;
+            const data = self.readMemU(u16, address);
+
+            self.setReg(a.rt, @bitCast(@as(i32, @as(i16, @bitCast(data)))));
+        }
+    }
+
+    fn ldrbimmT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm12: u12,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+            const addr = self.getReg(a.rn) + a.imm12;
+
+            self.setReg(a.rt, self.readMemU(u8, addr));
+        }
+    }
+
+    fn ldrbimmT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                W: bool,
+                U: bool,
+                P: bool,
+                _1: u1,
+                rt: u4,
+                //====
+                rn: u4,
+                _2: u12,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rn == 0b1111) unreachable; //TODO
+
+            if (!a.P and !a.W) self.undefined();
+
+            const add = a.U;
+            const index = a.P;
+            const wback = a.W;
+
+            const offset_addr = if (add) self.getReg(a.rn) + a.imm8 else self.getReg(a.rn) - a.imm8;
+            const addr = if (index) offset_addr else self.getReg(a.rn);
+            const data = self.readMemU(u8, addr);
+            self.setReg(a.rt, data);
+            if (wback) self.setReg(a.rn, offset_addr);
+        }
+    }
+
+    fn ldrbtT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                _1: u4,
+                rt: u4,
+                //====
+                rn: u4,
+                _2: u12,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rn == 0b1111) unreachable; //TODO
+
+            const addr = self.getReg(a.rn) + a.imm8;
+            const data = self.readMemU_Unpriv(u8, addr);
+
+            self.setReg(a.rt, data);
+        }
+    }
+
+    fn ldrblitT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm12: u12,
+                rt: u4,
+                //====
+                _0: u7,
+                U: bool,
+                _1: u8,
+            }, @bitCast(self.decoder.current));
+            const base = std.mem.alignBackward(u32, self.getPC(), 4);
+            const addr = if (a.U) base + a.imm12 else base + a.imm12;
+            self.setReg(a.rt, self.readMemU(u8, addr));
+        }
+    }
+
+    fn ldrbregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                imm2: u2,
+                rd: u6,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const offset = shift32(self.getReg(a.rm), .lsl, a.imm2, self.psr.c);
+            const address = self.getReg(a.rn) + offset;
+            const data = self.readMemU(u8, address);
+
+            self.setReg(a.rt, data);
+        }
+    }
+
+    fn ldrsbimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                W: bool,
+                U: bool,
+                P: bool,
+                _1: u1,
+                rt: u4,
+                //====
+                rn: u4,
+                _2: u12,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rn == 0b1111) unreachable; //TODO
+
+            if (!a.P and !a.W) self.undefined();
+
+            const add = a.U;
+            const index = a.P;
+            const wback = a.W;
+
+            const offset_addr = if (add) self.getReg(a.rn) + a.imm8 else self.getReg(a.rn) - a.imm8;
+            const addr = if (index) offset_addr else self.getReg(a.rn);
+            const data = self.readMemU(u8, addr);
+
+            self.setReg(a.rt, @bitCast(@as(i32, @as(i8, @bitCast(data)))));
+            if (wback) self.setReg(a.rn, offset_addr);
+        }
+    }
+
+    fn ldrsbtT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                W: bool,
+                U: bool,
+                P: bool,
+                _1: u1,
+                rt: u4,
+                //====
+                rn: u4,
+                _2: u12,
+            }, @bitCast(self.decoder.current));
+
+            if (a.rn == 0b1111) unreachable; //TODO
+
+            const addr = self.getReg(a.rn) + a.imm8;
+            const data = self.readMemU_Unpriv(u8, addr);
+            self.setReg(a.rt, @bitCast(@as(i32, @as(i8, @bitCast(data)))));
+        }
+    }
+
+    fn ldrsblitT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm12: u12,
+                rt: u4,
+                //====
+                _0: u7,
+                U: bool,
+                _1: u8,
+            }, @bitCast(self.decoder.current));
+
+            const base = std.mem.alignBackward(u32, self.getPC(), 4);
+            const address = if (a.U) base + a.imm12 else base - a.imm12;
+            const data = self.readMemU(u8, address);
+
+            self.setReg(a.rt, @bitCast(@as(i32, @as(i8, @bitCast(data)))));
+        }
+    }
+
+    fn ldrsbregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                imm2: u2,
+                rd: u6,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const offset = shift32(self.getReg(a.rm), .lsl, a.imm2, self.psr.c);
+            const address = self.getReg(a.rn) + offset;
+            const data = self.readMemU(u8, address);
+
+            self.setReg(a.rt, @bitCast(@as(i32, @as(i8, @bitCast(data)))));
+        }
+    }
+
+    fn strbimmT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm12: u12,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+            const addr = self.getReg(a.rn) + a.imm12;
+
+            self.writeMemU(u8, addr, @truncate(self.getReg(a.rt)));
+        }
+    }
+
+    fn strbimmT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                W: bool,
+                U: bool,
+                P: bool,
+                _1: u1,
+                rt: u4,
+                //====
+                rn: u4,
+                _2: u12,
+            }, @bitCast(self.decoder.current));
+
+            if (!a.P and !a.W or a.rn == 0b1111) self.undefined();
+
+            const add = a.U;
+            const index = a.P;
+            const wback = a.W;
+
+            const offset_addr = if (add) self.getReg(a.rn) + a.imm8 else self.getReg(a.rn) - a.imm8;
+            const addr = if (index) offset_addr else self.getReg(a.rn);
+            self.writeMemU(u8, addr, @truncate(self.getReg(a.rt)));
+            if (wback) self.setReg(a.rn, offset_addr);
+        }
+    }
+
+    fn strbregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                imm2: u2,
+                rd: u6,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const offset = shift32(self.getReg(a.rm), .lsl, a.imm2, self.psr.c);
+            const address = self.getReg(a.rn) + offset;
+            self.writeMemU(u8, address, @truncate(self.getReg(a.rt)));
+        }
+    }
+
+    fn strhimmT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm12: u12,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+            const addr = self.getReg(a.rn) + a.imm12;
+
+            self.writeMemU(u16, addr, @truncate(self.getReg(a.rt)));
+        }
+    }
+
+    fn strhimmT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                W: bool,
+                U: bool,
+                P: bool,
+                _1: u1,
+                rt: u4,
+                //====
+                rn: u4,
+                _2: u12,
+            }, @bitCast(self.decoder.current));
+
+            if (!a.P and !a.W or a.rn == 0b1111) self.undefined();
+
+            const add = a.U;
+            const index = a.P;
+            const wback = a.W;
+
+            const offset_addr = if (add) self.getReg(a.rn) + a.imm8 else self.getReg(a.rn) - a.imm8;
+            const addr = if (index) offset_addr else self.getReg(a.rn);
+            self.writeMemU(u16, addr, @truncate(self.getReg(a.rt)));
+            if (wback) self.setReg(a.rn, offset_addr);
+        }
+    }
+
+    fn strhregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                imm2: u2,
+                rd: u6,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const offset = shift32(self.getReg(a.rm), .lsl, a.imm2, self.psr.c);
+            const address = self.getReg(a.rn) + offset;
+            self.writeMemU(u16, address, @truncate(self.getReg(a.rt)));
+        }
+    }
+
+    fn strimmT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm12: u12,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+            const addr = self.getReg(a.rn) + a.imm12;
+
+            self.writeMemU(u32, addr, self.getReg(a.rt));
+        }
+    }
+
+    fn strimmT4(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm8: u8,
+                W: bool,
+                U: bool,
+                P: bool,
+                _1: u1,
+                rt: u4,
+                //====
+                rn: u4,
+                _2: u12,
+            }, @bitCast(self.decoder.current));
+
+            if (!a.P and !a.W or a.rn == 0b1111) self.undefined();
+
+            const add = a.U;
+            const index = a.P;
+            const wback = a.W;
+
+            const offset_addr = if (add) self.getReg(a.rn) + a.imm8 else self.getReg(a.rn) - a.imm8;
+            const addr = if (index) offset_addr else self.getReg(a.rn);
+            self.writeMemU(u32, addr, self.getReg(a.rt));
+            if (wback) self.setReg(a.rn, offset_addr);
+        }
+    }
+
+    fn strregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                imm2: u2,
+                rd: u6,
+                rt: u4,
+                //====
+                rn: u4,
+                _1: u12,
+            }, @bitCast(self.decoder.current));
+
+            const offset = shift32(self.getReg(a.rm), .lsl, a.imm2, self.psr.c);
+            const address = self.getReg(a.rn) + offset;
+            self.writeMemU(u32, address, self.getReg(a.rt));
+        }
+    }
+
+    fn andregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = self.getReg(a.rn) & shres.value;
+            self.setReg(a.rd, res);
+            if (a.S) {
+                self.psr.n = res & 0x8000_0000 != 0;
+                self.psr.z = res == 0;
+                self.psr.c = shres.carry;
+            }
+        }
+    }
+
+    fn tstregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = self.getReg(a.rn) & shres.value;
+
+            self.psr.n = res & 0x8000_0000 != 0;
+            self.psr.z = res == 0;
+            self.psr.c = shres.carry;
+        }
+    }
+
+    fn bicregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = self.getReg(a.rn) & ~shres.value;
+            self.setReg(a.rd, res);
+            if (a.S) {
+                self.psr.n = res & 0x8000_0000 != 0;
+                self.psr.z = res == 0;
+                self.psr.c = shres.carry;
+            }
+        }
+    }
+
+    fn orrregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = self.getReg(a.rn) | shres.value;
+            self.setReg(a.rd, res);
+            if (a.S) {
+                self.psr.n = res & 0x8000_0000 != 0;
+                self.psr.z = res == 0;
+                self.psr.c = shres.carry;
+            }
+        }
+    }
+
+    fn ornregT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = self.getReg(a.rn) | ~shres.value;
+            self.setReg(a.rd, res);
+            if (a.S) {
+                self.psr.n = res & 0x8000_0000 != 0;
+                self.psr.z = res == 0;
+                self.psr.c = shres.carry;
+            }
+        }
+    }
+
+    fn mvnregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = ~shres.value;
+            self.setReg(a.rd, res);
+            if (a.S) {
+                self.psr.n = res & 0x8000_0000 != 0;
+                self.psr.z = res == 0;
+                self.psr.c = shres.carry;
+            }
+        }
+    }
+
+    fn eorregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = self.getReg(a.rn) ^ shres.value;
+            self.setReg(a.rd, res);
+            if (a.S) {
+                self.psr.n = res & 0x8000_0000 != 0;
+                self.psr.z = res == 0;
+                self.psr.c = shres.carry;
+            }
+        }
+    }
+
+    fn teqregT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = self.getReg(a.rn) ^ shres.value;
+
+            self.psr.n = res & 0x8000_0000 != 0;
+            self.psr.z = res == 0;
+            self.psr.c = shres.carry;
+        }
+    }
+
+    fn addregT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = addWithCarry32(self.getReg(a.rn), shres.value, false);
+
+            if (a.rd == 15) {
+                self.aluWritePc(res.v);
+            } else {
+                self.setReg(a.rd, res.v);
+                if (a.S) {
+                    self.psr.n = res.v & 0x8000_0000 != 0;
+                    self.psr.z = res.v == 0;
+                    self.psr.c = res.carry_out;
+                    self.psr.v = res.overflow;
+                }
+            }
+        }
+    }
+
+    fn cmnregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = addWithCarry32(self.getReg(a.rn), shres.value, false);
+
+            self.psr.n = res.v & 0x8000_0000 != 0;
+            self.psr.z = res.v == 0;
+            self.psr.c = res.carry_out;
+            self.psr.v = res.overflow;
+        }
+    }
+
+    fn adcregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = addWithCarry32(self.getReg(a.rn), shres.value, self.psr.c);
+
+            self.setReg(a.rd, res.v);
+            if (a.S) {
+                self.psr.n = res.v & 0x8000_0000 != 0;
+                self.psr.z = res.v == 0;
+                self.psr.c = res.carry_out;
+                self.psr.v = res.overflow;
+            }
+        }
+    }
+
+    fn sbcregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = addWithCarry32(self.getReg(a.rn), ~shres.value, self.psr.c);
+
+            self.setReg(a.rd, res.v);
+            if (a.S) {
+                self.psr.n = res.v & 0x8000_0000 != 0;
+                self.psr.z = res.v == 0;
+                self.psr.c = res.carry_out;
+                self.psr.v = res.overflow;
+            }
+        }
+    }
+
+    fn subregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = addWithCarry32(self.getReg(a.rn), ~shres.value, true);
+
+            self.setReg(a.rd, res.v);
+            if (a.S) {
+                self.psr.n = res.v & 0x8000_0000 != 0;
+                self.psr.z = res.v == 0;
+                self.psr.c = res.carry_out;
+                self.psr.v = res.overflow;
+            }
+        }
+    }
+
+    fn cmpregT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = addWithCarry32(self.getReg(a.rn), ~shres.value, true);
+
+            self.psr.n = res.v & 0x8000_0000 != 0;
+            self.psr.z = res.v == 0;
+            self.psr.c = res.carry_out;
+            self.psr.v = res.overflow;
+        }
+    }
+
+    fn rsbregT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const sh = decodeImmShift(a.typ, (@as(u5, a.imm3) << 2) | a.imm2);
+            const shres = shiftc32(self.getReg(a.rm), sh.t, @truncate(sh.n), self.psr.c);
+            const res = addWithCarry32(~self.getReg(a.rn), shres.value, true);
+
+            self.setReg(a.rd, res.v);
+            if (a.S) {
+                self.psr.n = res.v & 0x8000_0000 != 0;
+                self.psr.z = res.v == 0;
+                self.psr.c = res.carry_out;
+                self.psr.v = res.overflow;
+            }
+        }
+    }
+
+    fn movregT3(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const res = self.getReg(a.rm);
+
+            if (a.rd == 15) {
+                self.aluWritePc(res);
+            } else {
+                self.setReg(a.rd, res);
+                if (a.S) {
+                    self.psr.n = res & 0x8000_0000 != 0;
+                    self.psr.z = res == 0;
+                }
+            }
+        }
+    }
+
+    fn lslimmT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            //TODO unnecessary
+            const sh = decodeImmShift(0, (@as(u5, a.imm3) << 2) | a.imm2);
+
+            const res = shiftc32(self.getReg(a.rm), .lsl, sh.n, self.psr.c);
+
+            self.setReg(a.rd, res.value);
+            if (a.S) {
+                self.psr.n = res.value & 0x8000_0000 != 0;
+                self.psr.z = res.value == 0;
+                self.psr.c = res.carry;
+            }
+        }
+    }
+
+    fn lsrimmT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            //TODO unnecessary
+            const sh = decodeImmShift(1, (@as(u5, a.imm3) << 2) | a.imm2);
+
+            const res = shiftc32(self.getReg(a.rm), .lsr, sh.n, self.psr.c);
+
+            self.setReg(a.rd, res.value);
+            if (a.S) {
+                self.psr.n = res.value & 0x8000_0000 != 0;
+                self.psr.z = res.value == 0;
+                self.psr.c = res.carry;
+            }
+        }
+    }
+
+    fn asrimmT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            //TODO unnecessary
+            const sh = decodeImmShift(2, (@as(u5, a.imm3) << 2) | a.imm2);
+
+            const res = shiftc32(self.getReg(a.rm), .asr, sh.n, self.psr.c);
+
+            self.setReg(a.rd, res.value);
+            if (a.S) {
+                self.psr.n = res.value & 0x8000_0000 != 0;
+                self.psr.z = res.value == 0;
+                self.psr.c = res.carry;
+            }
+        }
+    }
+
+    fn rrxT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const res = shiftc32(self.getReg(a.rm), .rrx, 1, self.psr.c);
+
+            self.setReg(a.rd, res.value);
+            if (a.S) {
+                self.psr.n = res.value & 0x8000_0000 != 0;
+                self.psr.z = res.value == 0;
+                self.psr.c = res.carry;
+            }
+        }
+    }
+
+    fn rorimmT1(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            //TODO unnecessary
+            const sh = decodeImmShift(3, (@as(u5, a.imm3) << 2) | a.imm2);
+
+            const res = shiftc32(self.getReg(a.rm), .ror, sh.n, self.psr.c);
+
+            self.setReg(a.rd, res.value);
+            if (a.S) {
+                self.psr.n = res.value & 0x8000_0000 != 0;
+                self.psr.z = res.value == 0;
+                self.psr.c = res.carry;
+            }
+        }
+    }
+
+    fn lslregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const res = shiftc32(self.getReg(a.rn), .lsl, @truncate(self.getReg(a.rm)), self.psr.c);
+
+            self.setReg(a.rd, res.value);
+            if (a.S) {
+                self.psr.n = res.value & 0x8000_0000 != 0;
+                self.psr.z = res.value == 0;
+                self.psr.c = res.carry;
+            }
+        }
+    }
+
+    fn lsrregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const res = shiftc32(self.getReg(a.rn), .lsr, @truncate(self.getReg(a.rm)), self.psr.c);
+
+            self.setReg(a.rd, res.value);
+            if (a.S) {
+                self.psr.n = res.value & 0x8000_0000 != 0;
+                self.psr.z = res.value == 0;
+                self.psr.c = res.carry;
+            }
+        }
+    }
+
+    fn asrregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const res = shiftc32(self.getReg(a.rn), .asr, @truncate(self.getReg(a.rm)), self.psr.c);
+
+            self.setReg(a.rd, res.value);
+            if (a.S) {
+                self.psr.n = res.value & 0x8000_0000 != 0;
+                self.psr.z = res.value == 0;
+                self.psr.c = res.carry;
+            }
+        }
+    }
+
+    fn rorregT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                typ: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const res = shiftc32(self.getReg(a.rn), .ror, @truncate(self.getReg(a.rm)), self.psr.c);
+
+            self.setReg(a.rd, res.value);
+            if (a.S) {
+                self.psr.n = res.value & 0x8000_0000 != 0;
+                self.psr.z = res.value == 0;
+                self.psr.c = res.carry;
+            }
+        }
+    }
+
+    fn sxthT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                rotate: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const rotated: i16 = @bitCast(@as(u16, @truncate(std.math.rotr(u32, self.getReg(a.rm), @as(u8, a.rotate) << 3))));
+            self.setReg(a.rd, @bitCast(@as(i32, rotated)));
+        }
+    }
+
+    fn uxthT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                rotate: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const rotated: u16 = @truncate(std.math.rotr(u32, self.getReg(a.rm), @as(u8, a.rotate) << 3));
+            self.setReg(a.rd, rotated);
+        }
+    }
+
+    fn sxtbT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                rotate: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const rotated: i8 = @bitCast(@as(u8, @truncate(std.math.rotr(u32, self.getReg(a.rm), @as(u8, a.rotate) << 3))));
+            self.setReg(a.rd, @bitCast(@as(i32, rotated)));
+        }
+    }
+
+    fn uxtbT2(self: *Cpu) void {
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                rm: u4,
+                rotate: u2,
+                imm2: u2,
+                rd: u4,
+                imm3: u3,
+                _0: u1,
+                //====
+                rn: u4,
+                S: bool,
+                _1: u11,
+            }, @bitCast(self.decoder.current));
+
+            const rotated: u8 = @truncate(std.math.rotr(u32, self.getReg(a.rm), @as(u8, a.rotate) << 3));
+            self.setReg(a.rd, rotated);
+        }
+    }
+
     fn exec(self: *Cpu, instr: Instr) void {
         std.debug.print("instr: {}\n", .{instr});
         switch (instr) {
+            else => unreachable,
+            .uxtbT2 => self.uxtbT2(),
+            .sxtbT2 => self.sxtbT2(),
+            .uxthT2 => self.uxthT2(),
+            .sxthT2 => self.sxthT2(),
+            .rorregT2 => self.rorregT2(),
+            .asrregT2 => self.asrregT2(),
+            .lsrregT2 => self.lsrregT2(),
+            .lslregT2 => self.lslregT2(),
+            .rrxT1 => self.rrxT1(),
+            .asrimmT2 => self.asrimmT2(),
+            .lsrimmT2 => self.lsrimmT2(),
+            .lslimmT2 => self.lslimmT2(),
+            .movregT3 => self.movregT3(),
+            .rsbregT1 => self.rsbregT1(),
+            .cmpregT3 => self.cmpregT3(),
+            .subregT2 => self.subregT2(),
+            .sbcregT2 => self.sbcregT2(),
+            .adcregT2 => self.adcregT2(),
+            .cmnregT2 => self.cmnregT2(),
+            .addregT3 => self.addregT3(),
+            .tegregT1 => self.teqregT1(),
+            .eorregT2 => self.eorregT2(),
+            .mvnregT2 => self.mvnregT2(),
+            .ornregT1 => self.ornregT1(),
+            .orrregT2 => self.orrregT2(),
+            .bicregT2 => self.bicregT2(),
+            .tstregT2 => self.tstregT2(),
+            .andregT2 => self.andregT2(),
+            .strregT2 => self.strregT2(),
+            .strimmT4 => self.strimmT4(),
+            .strimmT3 => self.strimmT3(),
+            .strhregT2 => self.strhregT2(),
+            .strhimmT2 => self.strhimmT2(),
+            .strhimmT3 => self.strhimmT3(),
+            .strbregT2 => self.strbregT2(),
+            .strbimmT2 => self.strbimmT2(),
+            .strbimmT3 => self.strbimmT3(),
+            .pldimmT1 => {}, // we dont do that here
+            .ldrsbregT2 => self.ldrsbregT2(),
+            .ldrsblitT1 => self.ldrsblitT1(),
+            .ldrsbtT1 => self.ldrsbtT1(),
+            .ldrsbimmT1 => self.ldrsbimmT1(),
+            .ldrbregT2 => self.ldrbregT2(),
+            .ldrbtT1 => self.ldrbtT1(),
+            .ldrbimmT3 => self.ldrbimmT3(),
+            .ldrbimmT2 => self.ldrbimmT2(),
+            .ldrshregT2 => self.ldrshregT2(),
+            .ldrshlitT1 => self.ldrshlitT1(),
+            .ldrshtT1 => self.ldrshtT1(),
+            .ldrshimmT1 => self.ldrshimmT1(),
+            .ldrhregT2 => self.ldrhregT2(),
+            .ldrhlitT1 => self.ldrhlitT1(),
+            .ldrhtT1 => self.ldrhtT1(),
+            .ldrhimmT3 => self.ldrhimmT3(),
+            .ldrhimmT2 => self.ldrhimmT2(),
+            .ldrlitT2 => self.ldrlitT2(),
+            .ldrregT2 => self.ldrregT2(),
+            .ldrimmT4 => self.ldrimmT4(),
+            .ldrimmT3 => self.ldrimmT3(),
+            .ldrexhT1 => self.ldrexhT1(),
+            .ldrexbT1 => self.ldrexbT1(),
+            .tbbT1 => self.tbbT1(),
+            .strexhT1 => self.strexhT1(),
+            .strexbT1 => self.strexbT1(),
+            .strdimmT1 => self.strdimmT1(),
+            .ldrdimmT1 => self.ldrdimmT1(),
+            .ldrexT1 => self.ldrexT1(),
+            .strexT1 => self.strexT1(),
+            .ldmdbT1 => self.ldmdbT1(),
+            //TODO pushT3
+            .pushT2 => self.pushT2(),
+            .stmdbT1 => self.stmdbT1(),
+            //TODO popT3
+            .popT2 => self.popT2(),
+            .ldmT2 => self.ldmT2(),
+            .stmT2 => self.stmT2(),
+            .isbT1 => self.isb(),
+            .dmbT1 => self.dmb(),
+            .dsbT1 => self.dsb(),
+            .clrexT1 => self.clrex(),
+            .dbgT1 => self.dbg(),
+            .sev, .sevT2 => self.sev(),
+            .wfi, .wfiT2 => self.wfi(),
+            .wfe, .wfeT2 => self.wfe(),
+            .yield, .yieldT2 => self.yield(),
+            .nop, .nopT2 => self.nop(),
+            .blT1 => self.blT1(),
+            .undefined => self.undefined(),
+            .mrsT1 => self.mrsT1(),
+            .msrT1 => self.msrT1(),
+            .bT4 => self.bT4(),
+            .bT3 => self.bT3(),
+            .ubfxT1 => self.ubfxT1(),
+            .usatT1 => self.usatT1(),
+            .bfiT1 => self.bfiT1(),
+            .bfcT1 => self.bfcT1(),
+            .ssatT1 => self.ssatT1(),
+            .movtT1 => self.movtT1(),
+            .subimmT4 => self.subimmT4(),
+            .movimmT3 => self.movimmT3(),
+            .adrT2 => self.adrT2(),
+            .adrT3 => self.adrT3(),
+            .addimmT4 => self.addimmT4(),
             .rsbimmT2 => self.rsbimmT2(),
             .cmpimmT2 => self.cmpimmT2(),
             .subimmT3 => self.subimmT3(),
@@ -2031,7 +4671,8 @@ const Cpu = struct {
             .cps => cps(self),
             .bT2 => bT2(self),
             .cbzcbnz => cbzcbnz(self),
-            else => unreachable,
+
+            //else => unreachable,
         }
 
         switch (instr) {
@@ -2156,6 +4797,7 @@ pub const Instr = enum { //
     cmpimmT2,
     subimmT3,
     rsbimmT2,
+
     //======
     adrT3,
     addimmT4,
@@ -2267,6 +4909,32 @@ pub const Instr = enum { //
     asrimmT2,
     rrxT1,
     rorimmT1,
+
+    lslregT2,
+    lsrregT2,
+    asrregT2,
+    rorregT2,
+    sxthT2,
+    uxthT2,
+    sxtbT2,
+    uxtbT2,
+
+    revT2,
+    rev16T2,
+    rbitT1,
+    revshT2,
+    clzT1,
+
+    mlaT1,
+    mulT2,
+    mlsT1,
+
+    smullT1,
+    sdivT1,
+    umullT1,
+    udivT1,
+    smlalT1,
+    umlalT1,
 };
 
 pub const Decoder = struct {
@@ -2691,6 +5359,122 @@ pub const Decoder = struct {
         };
     }
 
+    fn dataProcReg(w: u32) Instr {
+        const a = @as(packed struct(u32) { //
+            _1: u4,
+            op2: u4,
+            _2: u8,
+            //===
+            rn: u4,
+            op1: u4,
+            _3: u8,
+        }, @bitCast(w));
+
+        return if (a.op2 == 0)
+            switch (a.op1 >> 1) {
+                0 => .lslregT2,
+                1 => .lsrregT2,
+                2 => .asrregT2,
+                3 => .rorregT2,
+                else => unreachable,
+            }
+        else switch (a.op1) {
+            0 => if (a.op2 & 0b1000 != 0 and a.rn == 0xf) .sxthT2 else unreachable,
+            1 => if (a.op2 & 0b1000 != 0 and a.rn == 0xf) .uxthT2 else unreachable,
+            0b100 => if (a.op2 & 0b1000 != 0 and a.rn == 0xf) .sxtbT2 else unreachable,
+            0b101 => if (a.op2 & 0b1000 != 0 and a.rn == 0xf) .uxtbT2 else unreachable,
+            else => if (a.op1 >> 2 == 0b10 and a.op2 >> 2 == 0b10) block: {
+                const b = @as(packed struct(u32) { //
+                    _1: u4,
+                    op2: u2,
+                    _2: u10,
+                    //===
+                    _3: u4,
+                    op1: u2,
+                    _4: u10,
+                }, @bitCast(w));
+
+                if (w & 0xf000 != 0xf000) break :block .undefined;
+
+                break :block switch (b.op1) {
+                    1 => switch (b.op2) {
+                        0 => .revT2,
+                        1 => .rev16T2,
+                        2 => .rbitT1,
+                        3 => .revshT2,
+                    },
+                    0b11 => switch (b.op2) {
+                        0 => .clzT1,
+                        else => unreachable,
+                    },
+                    else => unreachable,
+                };
+            } else unreachable,
+        };
+    }
+
+    fn multmultacc(w: u32) Instr {
+        const a = @as(packed struct(u32) { //
+            _1: u4,
+            op2: u2,
+            _2: u6,
+            ra: u4,
+            //===
+            _3: u4,
+            op1: u3,
+            _4: u9,
+        }, @bitCast(w));
+
+        return switch (a.op1) {
+            0 => switch (a.op2) {
+                0 => if (a.ra != 0xf) .mlaT1 else .mulT2,
+                1 => .mlsT1,
+                else => unreachable,
+            },
+            else => unreachable,
+        };
+    }
+
+    fn longmullongmullaccdiv(w: u32) Instr {
+        const a = @as(packed struct(u32) { //
+            _1: u4,
+            op2: u4,
+            _2: u8,
+            //===
+            _3: u4,
+            op1: u3,
+            _4: u9,
+        }, @bitCast(w));
+
+        return switch (a.op1) {
+            0 => switch (a.op2) {
+                0 => .smullT1,
+                else => unreachable,
+            },
+            1 => switch (a.op2) {
+                0xf => .sdivT1,
+                else => unreachable,
+            },
+            2 => switch (a.op2) {
+                0 => .umullT1,
+                else => unreachable,
+            },
+            3 => switch (a.op2) {
+                0xf => .udivT1,
+                else => unreachable,
+            },
+            4 => switch (a.op2) {
+                0 => .smlalT1,
+                else => unreachable,
+            },
+            0b110 => switch (a.op2) {
+                0 => .umlalT1,
+                else => unreachable,
+            },
+            else => unreachable,
+        };
+    }
+
     fn instr32(self: *Decoder, wh: u16) Instr {
         const wl = @as(u32, self.getWord() catch unreachable);
         self.current = (@as(u32, wh) << 16) | wl;
@@ -2714,6 +5498,12 @@ pub const Decoder = struct {
             return storeSingle32(self.current);
         } else if (wh >> 9 == 0b111_0101) {
             return dataProcShiftedReg(self.current);
+        } else if (wh >> 8 == 0b111_1101_0 and wl & 0xf000 == 0xf000) {
+            return dataProcReg(self.current);
+        } else if (wh >> 7 == 0b111_1101_10 and wl & 0b11000000 == 0) {
+            return multmultacc(self.current);
+        } else if (wh >> 7 == 0b111_1101_11) {
+            return longmullongmullaccdiv(self.current);
         }
         return .unknown;
     }
@@ -2737,7 +5527,12 @@ pub const Decoder = struct {
             word >> 13 == 0b100)
             loadstore(word)
         else if (word >> 10 == 0b10001) specDataBranch(word) else if (word >> 10 == 0b10000) dataProc(word) //
-            else if (word >> 14 == 0b00) shaddsubmovcmp(word) else if (word >> 11 == 0b1001) .ldrlitT1 else if (word >> 11 == 0b10101) .addspimmT1 else if (word >> 11 == 0b11000) .stmT1 else if (word >> 11 == 0b11001) .ldmT1 else if (word >> 11 == 0b10100) .adrT1 else unreachable;
+            else if (word >> 14 == 0b00) shaddsubmovcmp(word) //
+            else if (word >> 11 == 0b1001) .ldrlitT1 //
+            else if (word >> 11 == 0b10101) .addspimmT1 //
+            else if (word >> 11 == 0b11000) .stmT1 //
+            else if (word >> 11 == 0b11001) .ldmT1 //
+            else if (word >> 11 == 0b10100) .adrT1 else unreachable;
 
         return self.current_instr;
     }
