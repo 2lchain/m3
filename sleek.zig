@@ -428,8 +428,7 @@ test "extract bit" {
 
 const Cpu = struct {
     const Mode = enum { thread, handler };
-
-    const Exception = enum(u8) { //
+    const Exception = enum(u9) { //
         reset,
         nmi,
         hardfault,
@@ -442,6 +441,14 @@ const Cpu = struct {
         systick,
         _,
     };
+
+    /// The Vector table must be naturally aligned to a power of two whose alignment value is greater than or equal
+    /// to (Number of Exceptions supported x 4), with a minimum alignment of 128 bytes.T
+    fn vectorTableAlignment(exceptions_supported: u32) u32 {
+        const x = exceptions_supported * 4;
+        if (x > 128) return x;
+        return 128;
+    }
 
     const ITSTATE = packed struct(u8) {
         rest: u4,
@@ -561,8 +568,854 @@ const Cpu = struct {
     const FAULTMASK = packed struct(u32) { fm: bool = false, rest: u31 = 0 };
     const BASEPRI = packed struct(u32) { basepri: u8 = 0, rest: u24 = 0 };
 
+    const SCS = struct {
+        const START = 0xe000e000;
+        const STOP = 0xe000efff;
+        const Regs = struct {
+            const ACTLR = packed struct(u32) {
+                const addr = 0xE000E008;
+                _1: u32 = 0,
+            };
+            const CPUID = struct {
+                const base_reg_addr = 0xE000ED00;
+                const BaseReg = packed struct(u32) { //
+                    revision: u4 = 0,
+                    partno: u12 = 0,
+                    constant: u4 = 0xf,
+                    variant: u4 = 0,
+                    implementer: u8 = 0,
+                };
+            };
+            const ICSR = packed struct(u32) {
+                const addr = 0xE000ED04;
+
+                /// value == 0: Thread mode
+                ///  value > 1: the exception numberc for the current executing
+                // exception
+                vectactive: u9 = 0,
+                _1: u1 = 0,
+                ///This bit is 1 when the set of all active exceptions minus the
+                ///IPSR_current_exception yields the empty set.
+                rettobase: bool = false,
+                ///Indicates the exception number for the highest priority
+                ///pending exception.
+                /// value == 0: no pending exceptions
+                vectpending: u10 = 0,
+                _2: u1 = 0,
+                ///Indicates if an external configurable (NVIC generated)
+                ///interrupt is pending.
+                isrprnding: bool = false,
+                /// If set, a pending exception will be serviced on exit from the
+                /// debug halt stat
+                ispreempt: bool = false,
+                _3: u1 = 0,
+                /// Clear a pending SysTick (whether set here or by the timer
+                /// hardware).
+                pendstclr: bool = false,
+                /// Set a pending SysTick. Reads back with current state (1 if
+                /// Pending, 0 if not).
+                pendstset: bool = false,
+                /// Clear a pending PendSV interrupt.
+                pendsvclr: bool = false,
+                /// Set a pending PendSV interrupt. This is normally used to
+                /// request a context switch. Reads back with current state (1 if
+                /// Pending, 0 if not).
+                pendsvset: bool = false,
+                _4: u2 = 0,
+                /// Setting this bit will activate an NMI. Since NMI is higher
+                /// priority than other exceptions, the NMI exception will
+                /// activate as soon as it is registered.
+                nmipendset: bool = false,
+            };
+            const VTOR = packed struct(u32) {
+                const addr = 0xE000ED08;
+
+                _1: u7 = 0,
+                /// Table offset address[28:7] from the base address defined by
+                /// TBLBASE.
+                ///  The offset address is 32-word aligned. Where more than 16
+                /// external interrupts are used, the offset word alignment must be
+                /// increased to accommodate vectors for all the exceptions and
+                /// interrupts supported and keep the required table size naturally
+                /// aligned. See Interrupt Controller Type Register (ICTR) on
+                /// page B3-32 for information on the number of interrupts
+                /// supported.
+                tbloff: u22 = 0,
+                ///
+                /// value ==0: Table base is in CODE, base address 0x00000000
+                ///value ==1: Table base is in RAM, base address 0x20000000
+                tblbase_is_ram: bool = false,
+                _2: u2 = 0,
+            };
+            const AIRCR = packed struct(u32) {
+                const addr = 0xE000ED0C;
+                /// Local system reset, see Reset management on
+                /// page B1-47 for details. This bit self-clears.
+                /// Writing a 1 to this bit when not in debug state (halted) is
+                /// UNPREDICTABLE.
+                ///  If VECTRESET and SYSRESETREQ are set
+                /// simultaneously, the behavior is UNPREDICTABLE.
+                vectreset: bool = false,
+                /// Clears all active state information for fixed and
+                /// configurable exceptions. This bit self-clears.
+                /// Note: It is the application’s responsibility to re-initialize
+                /// the stack.
+                ///  Writing a 1 to this bit when not in debug state (halted) is
+                /// UNPREDICTABLE.
+                vectclractive: bool = false,
+                /// Writing this bit 1 will cause a signal to be asserted to the
+                /// external system to indicate a reset is requested. The
+                /// signal is required to generate a Local Reset.
+                ///  The bit self-clears as part of the reset sequence.
+                sysresetreq: bool = false,
+                _2: u5 = 0,
+                /// Priority grouping position (binary point). This field sets
+                /// the interpretation of priority registers, both for handlers
+                /// and standard interrupts. For a definition of how this bit
+                /// field is interpreted to assign priority and priority
+                /// sub-group bit fields to the System Handler and NVIC
+                /// priority registers, see Priority grouping on page B1-18)
+                ///  This field is cleared on reset.
+                prigroup: u3 = 0,
+                _3: u4 = 0,
+                big_endian: bool = false,
+                vectkey_vectkeystat: u16 = 0,
+
+                inline fn vectkeystat() u16 {
+                    return 0xfa05;
+                }
+            };
+            const SCR = packed struct(u32) {
+                const addr = 0xE000ED10;
+
+                _1: bool = false,
+                /// When enabled,  interrupt transitions from Inactive to
+                /// Pending are included in the list of wakeup events for the WFE
+                /// instruction.
+                ///  See WFE wake-up events on page B1-49 for more
+                /// information.
+                sleeponexit: bool = false,
+                /// A qualifying hint that indicates waking from sleep might
+                /// take longer. Implementations can take advantage of the
+                /// feature to identify a lower power sleep state.
+                sleepdeep: bool = false,
+                _2: bool = false,
+
+                ///  When enabled,  interrupt transitions from Inactive to
+                /// Pending are included in the list of wakeup events for the WFE
+                /// instruction.
+                ///  See WFE wake-up events on page B1-49 for more
+                /// information.
+                sevonpend: bool = false,
+                _3: u27 = 0,
+            };
+            const CCR = packed struct(u32) {
+                const addr = 0xE000ED14;
+
+                /// 0 (default): Thread state can only be entered at the
+                /// Base level of activation (will fault if attempted to
+                /// another level of activation).
+                ///  1: Thread state can be entered at any level by
+                /// controlled return value. See Exception return
+                /// behavior on page B1-25 for details.
+                nonebasethrdena: bool = false,
+                /// When this bit is set (=1), the core allows unprivileged
+                /// (user) code to write the Software Trigger Interrupt
+                /// register. See Software Trigger Interrupt Register
+                /// (STIR) on page B3-23.
+                usersetmpend: bool = false,
+                _1: u1 = 0,
+                /// Enable bit (=1) for trapping unaligned half or full
+                /// word accessesa
+                unalign_trp: bool = false,
+                /// Enable bit (=1) for trap on Divide by 0.
+                div0trp: bool = false,
+                _2: u3 = 0,
+                /// When enabled (=1), this causes handlers running at
+                /// priority -1 and -2 to ignore Precise data access faults.
+                /// When disabled (=0), these bus faults will cause a
+                /// lock-up as explained in Unrecoverable exception
+                /// cases on page B1-44.
+                bfhfnmign: bool = false,
+                /// 1: on exception entry, the SP used prior to the
+                /// exception is adjusted to be 8-byte aligned and the
+                /// context to restore it is saved. The SP is restored on the
+                /// associated exception return.
+                ///  0: only 4-byte alignment is guaranteed for the SP used
+                /// prior to the exception on exception entry.
+                ///  The bit is cleared on reset. See Stack alignment on
+                /// exception entry on page B1-24 for more information.
+                stackalign: bool = false,
+                _3: u22 = 0,
+            };
+            const SHPR1 = packed struct(u32) {
+                const addr = 0xE000ED18;
+                pri4: u8 = 0,
+                pri5: u8 = 0,
+                pri6: u8 = 0,
+                pri7: u8 = 0,
+            };
+            const SHPR2 = packed struct(u32) {
+                const addr = 0xE000ED1C;
+
+                pri8: u8 = 0,
+                pri9: u8 = 0,
+                pri10: u8 = 0,
+                pri11: u8 = 0,
+            };
+            const SHPR3 = packed struct(u32) {
+                const addr = 0xE000ED20;
+                pri12: u8 = 0,
+                pri13: u8 = 0,
+                pri14: u8 = 0,
+                pri15: u8 = 0,
+            };
+            const SHCSR = packed struct(u32) {
+                const addr = 0xE000ED24;
+
+                memfaultact: bool = false,
+                busfaultact: bool = false,
+                _1: bool = false,
+                usgfaultact: bool = false,
+                _2: u3 = 0,
+                svccallact: bool = false,
+                monitoract: bool = false,
+                _3: u1 = 0,
+                pendsvact: bool = false,
+                systickact: bool = false,
+                usgfaultpended: bool = false,
+                memfaultpended: bool = false,
+                busfaultpended: bool = false,
+                svccallpended: bool = false,
+                memfaultena: bool = false,
+                busfaultena: bool = false,
+                usgfaultena: bool = false,
+                _4: u13 = 0,
+            };
+            const CFSR = packed struct(u32) {
+                const addr = 0xE000ED28;
+
+                const MemManage = packed struct(u8) {
+                    const addr = 0xE000ED28;
+
+                    /// MPU or eXecuteNever (XN) default memory map access
+                    /// violation on an instruction fetch. The fault is only signalled
+                    /// if the instruction is issued.
+                    iaccviol: bool = false,
+                    /// Data access violation. The MMAR is set to the data address
+                    /// which the load/store tried to access.
+                    daccviol: bool = false,
+                    _1: u1 = 0,
+                    /// A derived MemManage fault has occurred on exception
+                    /// return.
+                    munstkerr: bool = false,
+                    /// A derived MemManage fault has occurred on exception
+                    /// entry.
+                    mstkerr: bool = false,
+                    _2: u2 = 0,
+                    /// This bit is set if the MMAR register has valid contents
+                    mmarvalid: bool = false,
+                };
+
+                const BusFault = packed struct(u8) {
+                    const addr = 0xE000ED29;
+
+                    /// This bit indicates a bus fault on an instruction prefetch. The
+                    /// fault is only signalled if the instruction is issued.
+                    ibuserr: bool = false,
+                    /// Precise data access error. The BFAR is written with the
+                    /// faulting address.
+                    preciserr: bool = false,
+                    /// Imprecise data access error.
+                    impreciserr: bool = false,
+                    /// This bit indicates a derived bus fault has occurred on
+                    /// exception return.
+                    unstkerr: bool = false,
+                    /// This bit indicates a derived bus fault has occurred on
+                    /// exception entry.
+                    stkerr: bool = false,
+                    _1: u2 = 0,
+                    ///  This bit is set if the BFAR register has valid contents.
+                    bfarvalid: bool = false,
+                };
+
+                const UsageFault = packed struct(u16) {
+                    const addr = 0xE000ED2A;
+
+                    /// Undefined instruction executed (including those associated
+                    /// with an enabled Coprocessor).
+                    undefinstr: bool = false,
+                    /// Invalid EPSR.T bit or illegal EPSR.IT bits for executing
+                    /// instruction
+                    invstate: bool = false,
+                    /// Integrity check error on EXC_RETURN.
+                    invpc: bool = false,
+                    /// Coprocessor access error (the coprocessor is disabled or not
+                    /// present)
+                    nocp: bool = false,
+                    _1: u4 = 0,
+                    /// Unaligned access error. Multi-word accesses always fault if
+                    /// not word aligned. Unaligned word and halfwords can be
+                    /// configured to fault (UNALIGN_TRP is enabled)
+                    unaligned: bool = false,
+                    /// Divide by zero error. When SDIV or UDIV instruction is used
+                    /// with a divisor of 0, this fault will occur if DIV_0_TRP is
+                    /// enabled.
+                    divbyzero: bool = false,
+                    _2: u6 = 0,
+                };
+
+                mem_manage: MemManage = .{},
+                bus_fault: BusFault = .{},
+                usage_fault: UsageFault = .{},
+            };
+            const HFSR = packed struct(u32) {
+                const addr = 0xE000ED2C;
+                _1: u1 = 0,
+                /// Fault was due to vector table read on exception processing.
+                vecttbl: bool = false,
+                _2: u28 = 0,
+                /// Configurable fault cannot be activated due to priority or
+                /// because it is disabled. Priority escalated to a HardFault
+                /// exception.
+                ///  See Priority escalation on page B1-19.
+                forced: bool = false,
+                /// Debug event, and the Debug Fault Status Register has been
+                /// updated. Only set when halting debug is disabled
+                /// (C_DEBUGEN = 0) See Debug event behavior on
+                /// page C1-14 for more information
+                debugevt: bool = false,
+            };
+            const DFSR = packed struct(u32) {
+                const addr = 0xE000ED30;
+                _1: u32 = 0,
+            };
+            const AFSR = packed struct(u32) {
+                const addr = 0xE000ED3C;
+                _1: u32 = 0,
+            };
+            const MMFAR = packed struct(u32) {
+                const addr = 0xE000ED34;
+                /// Data address MPU faulted. This is the location which a load or
+                /// store attempted to access which was faulted. The MemManage
+                /// Status Register provides the cause, and indicates if the content of
+                /// this register is valid.When an unaligned access faults, the address
+                /// will be the actual address which faulted; since an access may be
+                /// split into multiple parts (each aligned), this address therefore may
+                /// be any offset in the range of the requested size.
+                address: u32 = 0,
+            };
+
+            const BFAR = packed struct(u32) {
+                const addr = 0xE000ED38;
+                /// Updated on precise data access faults. The value is the faulting
+                /// address associated with the attempted access. The BusFault Status
+                /// Register provides information on the reason, and indicates if the
+                /// content of this register is valid.For unaligned access faults, the
+                /// address is the address requested by the instruction, which is not
+                /// necessarily the address which faulted.
+                address: u32 = 0,
+            };
+            const CPACR = packed struct(u32) {
+                const addr = 0xE000ED88;
+                cpacr: u32 = 0,
+            };
+
+            const PID4 = packed struct(u32) {
+                const addr = 0xE000EFD0;
+                _1: u32 = 0,
+            };
+            const PID5 = packed struct(u32) {
+                const addr = 0xE000EFD4;
+                _1: u32 = 0,
+            };
+            const PID6 = packed struct(u32) {
+                const addr = 0xE000EFD8;
+                _1: u32 = 0,
+            };
+            const PID7 = packed struct(u32) {
+                const addr = 0xE000EFDC;
+                _1: u32 = 0,
+            };
+            const PID0 = packed struct(u32) {
+                const addr = 0xE000EFE0;
+                _1: u32 = 0,
+            };
+            const PID1 = packed struct(u32) {
+                const addr = 0xE000EFE4;
+                _1: u32 = 0,
+            };
+            const PID2 = packed struct(u32) {
+                const addr = 0xE000EFE8;
+                _1: u32 = 0,
+            };
+            const PID3 = packed struct(u32) {
+                const addr = 0xE000EFEC;
+                _1: u32 = 0,
+            };
+
+            const CID0 = packed struct(u32) {
+                const addr = 0xE000EFF0;
+                _1: u32 = 0,
+            };
+            const CID1 = packed struct(u32) {
+                const addr = 0xE000EFF4;
+                _1: u32 = 0,
+            };
+            const CID2 = packed struct(u32) {
+                const addr = 0xE000EFF8;
+                _1: u32 = 0,
+            };
+            const CID3 = packed struct(u32) {
+                const addr = 0xE000EFFC;
+                _1: u32 = 0,
+            };
+
+            const SysTick = struct {
+                const SYST_CSR = packed struct(u32) {
+                    const addr = 0xE000E010;
+                    /// 0: the counter is disabled
+                    ///  1: the counter will operate in a multi-shot manner.
+                    enable: bool,
+                    /// If 1, counting down to 0 will cause the SysTick exception to
+                    /// be pended. Clearing the SysTick Current Value register by a
+                    /// register write in software will not cause SysTick to be
+                    /// pended.
+                    tickint: bool,
+                    /// 0: clock source is (optional) external reference clock
+                    ///  1: core clock used for SysTick
+                    ///  If no external clock provided, this bit will read as 1 and
+                    /// ignore writes.
+                    clcksource: bool,
+                    _1: u13,
+                    /// Returns 1 if timer counted to 0 since last time this register
+                    /// was read. COUNTFLAG is set by a count transition from 1
+                    /// => 0. COUNTFLAG is cleared on read or by a write to the
+                    /// Current Value register.
+                    countflag: bool,
+                    _2: u15,
+                };
+
+                const SYST_RVR = packed struct(u32) {
+                    const addr = 0xE000E014;
+                    /// Value to load into the Current Value register when the counter
+                    /// reaches 0.
+                    reload: u24,
+                    _1: u8,
+                };
+
+                const SYST_CVR = packed struct(u32) {
+                    const addr = 0xE000E018;
+                    /// Current counter value. This is the value of the counter at the time
+                    /// it is sampled. The counter does not provide read-modify-write
+                    /// protection.The register is write-clear. A software write of any
+                    /// value will clear the register to 0. Unsupported bits RAZ (see
+                    /// SysTick Reload Value register).
+                    current: u32,
+                };
+
+                const SYST_CALIB = packed struct(u32) {
+                    const addr = 0xE000E01C;
+                    /// An optional Reload value to be used for 10ms (100Hz) timing,
+                    /// subject to system clock skew errors. If the value reads as 0, the
+                    /// calibration value is not known.
+                    tenms: u24,
+                    _1: u6,
+                    /// If reads as 1, the calibration value for 10ms is inexact (due to clock
+                    /// frequency).
+                    skew: bool,
+                    /// If reads as 1, the Reference clock is not provided – the
+                    /// CLKSOURCE bit of the SysTick Control and Status register will
+                    /// be forced to 1 and cannot be cleared to 0.
+                    noref: bool,
+                };
+            };
+
+            const NVIC = struct {
+                const STIR = packed struct(u32) {
+                    const addr = 0xE000EF00;
+                    /// The value written in this field is the interrupt to be triggered. This
+                    /// acts the same as storing to the corresponding ISPR[x] set-pending
+                    /// NVIC register bit. See Interrupt Set-Pending and Clear-Pending
+                    /// Registers (NVIC_ISPRx and NVIC_ICPRx) on page B3-33.
+                    ///  This register applies to external interrupts only. The value written is
+                    /// (ExceptionNumber - 16), see Exception number definition on
+                    /// page B1-16.
+                    intid: u9 = 0,
+                    _1: u23 = 0,
+                };
+
+                const ICTR = packed struct(u32) {
+                    const addr = 0xE000E004;
+                    /// Number of interrupt lines supported by NVIC in
+                    /// granularities of 32.
+                    intlinesnum: u4 = 0,
+                    _1: u28 = 0,
+
+                    fn getIntlines(self: ICTR) u32 {
+                        return (self.intlinesnum * 32) + 32;
+                    }
+                };
+
+                const NVIC_ISER = packed struct(u32) {
+                    const addr = 0xE000E100;
+                    /// Enable one or more interrupts within a group of 32. Each bit
+                    /// represents an interrupt number from N to N+31 (starting at
+                    /// interrupt 0, 32, 64, etc).
+                    /// Writing a 1 will enable the associated interrupt.
+                    /// Writing a 0 has no effect.
+                    /// The register reads back with the current enable state.
+                    setena: u32 = 0,
+                };
+
+                const NVIC_ICER = packed struct(u32) {
+                    const addr = 0xE000E180;
+                    /// Disable one or more interrupts within a group of 32. Each bit
+                    /// represents an interrupt number from N to N+31 (starting at
+                    /// interrupt 0, 32, 64, etc).
+                    /// Writing a 1 will disable the associated interrupt.
+                    ///  Writing a 0 has no effect.
+                    ///  The register reads back with the current enable state.
+                    clrena: u32 = 0,
+                };
+
+                const NVIC_ISPR = packed struct(u32) {
+                    const addr = 0xE000E200;
+
+                    ///  Writing a 1 to a bit pends the associated interrupt under software
+                    /// control. Each bit represents an interrupt number from N to N+31
+                    /// (starting at interrupt 0, 32, 64, etc).
+                    /// Writing a 0 to a bit has no effect on the associated interrupt.The
+                    /// register reads back with the current pending state.
+                    setpend: u32 = 0,
+                };
+
+                const NVIC_ICPR = packed struct(u32) {
+                    const addr = 0xE000E280;
+                    /// Writing a 1 to a bit un-pends the associated interrupt under
+                    /// software control. Each bit represents an interrupt number from N
+                    /// to N+31 (starting at interrupt 0, 32, 64, etc).
+                    /// Writing a 0 to a bit has no effect on the associated interrupt.
+                    ///  The register reads back with the current pending state.
+                    clrpend: u32 = 0,
+                };
+
+                const NVIC_IABR = packed struct(u32) {
+                    const addr = 0xE000E300;
+                    /// Each bit represents the current active state for the associated
+                    /// interrupt within a group of 32. Each bit represents an interrupt
+                    /// number from N to N+31 (starting at interrupt 0, 32, 64, etc).
+                    active: u32 = 0,
+                };
+
+                const NVIC_IPR = packed struct(u32) {
+                    const addr = 0xE000E400;
+                    /// Priority of interrupt number N (0, 4, 8, etc).
+                    pri_n: u8 = 0,
+                    /// Priority of interrupt number N+1 (1, 5, 9, etc).
+                    pri_n1: u8 = 0,
+                    /// Priority of interrupt number N+2 (2, 6, 10, etc).
+                    pri_n2: u8 = 0,
+                    /// Priority of interrupt number N+3 (3, 7, 11, etc).
+                    pri_n3: u8 = 0,
+                };
+            };
+        };
+    };
+
+    const SAM = struct {
+        const MB4: u32 = 1024 * 1024 * 4;
+        const Map = struct { begin: u32, end: u32, realbegin: u32 };
+
+        const code = Map{ //
+            .begin = 0x00000000,
+            .realbegin = 0,
+            .end = 0x1FFFFFFF,
+        };
+        const sram = Map{ //
+            .begin = 0x20000000,
+            .realbegin = MB4,
+            .end = 0x3FFFFFFF,
+        };
+        const peripheral = Map{ //
+            .begin = 0x40000000,
+            .realbegin = MB4 * 2,
+            .end = 0x5FFFFFFF,
+        };
+        const ram0 = Map{ //
+            .begin = 0x60000000,
+            .end = 0x7FFFFFFF,
+            .realbegin = MB4 * 3,
+        };
+        const ram1 = Map{ //
+            .begin = 0x80000000,
+            .end = 0x9FFFFFFF,
+            .realbegin = MB4 * 4,
+        };
+        const device_shared = Map{ //
+            .begin = 0xA0000000,
+            .end = 0xBFFFFFFF,
+            .realbegin = MB4 * 5,
+        };
+        const device_nonshared = Map{ //
+            .begin = 0xC0000000,
+            .end = 0xDFFFFFFF,
+            .realbegin = MB4 * 6,
+        };
+        const system = Map{ //
+            .begin = 0xE0000000,
+            .end = 0xFFFFFFFF,
+            .realbegin = MB4 * 7,
+        };
+    };
+
+    // offset in 4 bytes
+    fn readMemMappedReg(self: *Cpu, T: type, offset: u32) T {
+        if (@hasDecl(T, "addr")) {
+            const reg = self.readMemA(u32, T.addr + (offset * 4));
+            return @bitCast(reg);
+        } else @compileError(std.fmt.comptimePrint("{s} has no addr decr.\n", .{@typeName(T)}));
+    }
+
+    // offset in 4 bytes
+    fn writeMemMappedReg(self: *Cpu, T: type, value: T, offset: u32) void {
+        if (@hasDecl(T, "addr")) {
+            self.writeMemA(u32, T.addr + (offset * 4), @bitCast(value));
+        } else @compileError(std.fmt.comptimePrint("{s} has no addr field.\n", .{@typeName(T)}));
+    }
+
+    fn resetSCSRegs(self: *Cpu) void {
+        _ = self;
+        //TODO
+    }
+
+    fn updateSCSRegs(self: *Cpu) void {
+        _ = self;
+        //TODO
+    }
+
+    fn clearExclusiveLocal(self: *Cpu) void {
+        _ = self;
+        //TODO
+    }
+
+    fn clearEventRegister(self: *Cpu) void {
+        _ = self;
+        //TODO
+    }
+
+    fn returnAddress(self: *Cpu) u32 {
+        //TODO
+        return self.PC;
+    }
+
+    fn setEventRegister(self: *Cpu) void {
+        _ = self;
+        //TODO
+    }
+
+    fn instructionSyncBarrier(self: *Cpu) void {
+        _ = self;
+        //TODO
+    }
+
+    fn pushStack(self: *Cpu) void {
+        const ccr = self.readMemMappedReg(SCS.Regs.CCR, 0);
+        const curr_sp = if (self.control.one and self.getMode() == .thread)
+            self.regs[SP_PROC] //
+        else
+            self.regs[SP_MAIN];
+
+        const frameptralign = ((curr_sp & 0b10) > 0) and ccr.stackalign;
+        const frameptr = (curr_sp - 0x20) & ~@as(u32, if (ccr.stackalign) 0b100 else 0);
+
+        self.writeMemA(u32, frameptr, self.getReg(0));
+        self.writeMemA(u32, frameptr + 4, self.getReg(1));
+        self.writeMemA(u32, frameptr + 8, self.getReg(2));
+        self.writeMemA(u32, frameptr + 12, self.getReg(3));
+        self.writeMemA(u32, frameptr + 16, self.getReg(12));
+        self.writeMemA(u32, frameptr + 20, self.getRL());
+        self.writeMemA(u32, frameptr + 24, self.returnAddress());
+        var psr = self.psr;
+        psr.a = frameptralign;
+        self.writeMemA(u32, frameptr + 28, @bitCast(psr));
+
+        if (self.getMode() == .handler) {
+            self.setRL(0xffff_fff1);
+        } else {
+            if (self.control.one) {
+                self.setRL(0xffff_fffd);
+            } else {
+                self.setRL(0xffff_fff9);
+            }
+        }
+    }
+
+    fn exceptionTaken(self: *Cpu, exept: u9) void {
+        const vector_table: u32 = @bitCast(self.readMemMappedReg(SCS.Regs.VTOR, 0));
+        const tmp = self.readMemA(u32, vector_table + 4 * exept);
+        self.PC = tmp & 0xffff_fffe;
+        self.setMode(.handler);
+        self.psr.exception = exept;
+        self.psr.t = (tmp & 1) == 1;
+        self.psr.setIT(0);
+        self.control.one = false;
+        self.exception_active[exept] = 1;
+        //TODO
+        self.updateSCSRegs();
+        self.clearExclusiveLocal();
+        self.setEventRegister();
+        self.instructionSyncBarrier();
+    }
+
+    fn exceptionActiveBitCount(self: *Cpu) u32 {
+        var res: u32 = 0;
+        for (self.exception_active[0..]) |e| {
+            if (e == 1) res += 1;
+        }
+        return res;
+    }
+
+    fn deActivate(self: *Cpu, returning_excpt: u9) void {
+        self.exception_active[returning_excpt] = 0;
+        if (self.psr.exception != 0b10) {
+            self.faultmask.fm = false;
+        }
+    }
+
+    fn popStack(self: *Cpu, frameptr: u32, excret: u4) void {
+        self.setReg(0, self.readMemA(u32, frameptr));
+        self.setReg(1, self.readMemA(u32, frameptr + 4));
+        self.setReg(2, self.readMemA(u32, frameptr + 8));
+        self.setReg(3, self.readMemA(u32, frameptr + 12));
+        self.setReg(12, self.readMemA(u32, frameptr + 16));
+        self.setRL(self.readMemA(u32, frameptr + 20));
+        self.setPC(self.readMemA(u32, frameptr + 24));
+        self.psr = @bitCast(self.readMemA(u32, frameptr + 28));
+
+        const ccr = self.readMemMappedReg(SCS.Regs.CCR, 0);
+
+        var stkln: u32 = if (ccr.stackalign) 0b1 else 0;
+        if (self.psr.a) stkln &= 1 else stkln &= 0;
+        stkln <<= 2;
+        switch (excret) {
+            0b1, 0b1001 => self.regs[SP_MAIN] = (self.regs[SP_MAIN] + 0x20) | stkln,
+            0b1101 => self.regs[SP_PROC] = (self.regs[SP_PROC] + 0x20) | stkln,
+            else => unreachable,
+        }
+    }
+
+    fn exceptionReturn(self: *Cpu, exc_ret: u28) void {
+        const nested_activation = self.exceptionActiveBitCount();
+
+        if (self.getMode() != .handler) {
+            std.debug.print("FATAL: exception return in thread mode!!!. Reseting...\n", .{});
+            self.takeReset();
+        }
+        const returning_exception_number = self.psr.exception;
+
+        var cfsr = self.readMemMappedReg(SCS.Regs.CFSR, 0);
+        const ccr = self.readMemMappedReg(SCS.Regs.CCR, 0);
+        var frame_ptr: u32 = undefined;
+
+        if (self.exception_active[returning_exception_number] == 0) {
+            self.deActivate(returning_exception_number);
+            cfsr.usage_fault.invpc = true;
+            self.writeMemMappedReg(SCS.Regs.CFSR, cfsr, 0);
+            self.setRL(0xf000_0000 + exc_ret);
+            self.exceptionTaken(@intFromEnum(Exception.usagefault));
+            return;
+        }
+        switch (exc_ret & 0b1111) {
+            1 => {
+                if (nested_activation == 1) {
+                    self.deActivate(returning_exception_number);
+                    cfsr.usage_fault.invpc = true;
+                    self.writeMemMappedReg(SCS.Regs.CFSR, cfsr, 0);
+                    self.setRL(0xf000_0000 + exc_ret);
+                    self.exceptionTaken(@intFromEnum(Exception.usagefault));
+                    return;
+                }
+                frame_ptr = self.regs[SP_MAIN];
+                self.setMode(.handler);
+                self.control.one = false;
+            },
+            0b1001, 0b1101 => |v| {
+                if (nested_activation != 1 and !ccr.nonebasethrdena) {
+                    self.deActivate(returning_exception_number);
+                    cfsr.usage_fault.invpc = true;
+                    self.writeMemMappedReg(SCS.Regs.CFSR, cfsr, 0);
+                    self.setRL(0xf000_0000 + exc_ret);
+                    self.exceptionTaken(@intFromEnum(Exception.usagefault));
+                    return;
+                }
+                frame_ptr = self.regs[if (v == 0b1001) SP_MAIN else SP_PROC];
+                self.setMode(.thread);
+                self.control.one = false;
+            },
+            else => {
+                self.deActivate(returning_exception_number);
+                cfsr.usage_fault.invpc = true;
+                self.writeMemMappedReg(SCS.Regs.CFSR, cfsr, 0);
+                self.setRL(0xf000_0000 + exc_ret);
+                self.exceptionTaken(@intFromEnum(Exception.usagefault));
+                return;
+            },
+        }
+
+        self.deActivate(returning_exception_number);
+        self.popStack(frame_ptr, @truncate(exc_ret));
+
+        if (self.getMode() == .handler and self.psr.exception == 0) {
+            self.deActivate(returning_exception_number);
+            cfsr.usage_fault.invpc = true;
+            self.writeMemMappedReg(SCS.Regs.CFSR, cfsr, 0);
+            self.pushStack();
+            self.setRL(0xf000_0000 + exc_ret);
+            self.exceptionTaken(@intFromEnum(Exception.usagefault));
+            return;
+        }
+
+        if (self.getMode() == .thread and self.psr.exception != 0) {
+            self.deActivate(returning_exception_number);
+            cfsr.usage_fault.invpc = true;
+            self.writeMemMappedReg(SCS.Regs.CFSR, cfsr, 0);
+            self.pushStack();
+            self.setRL(0xf000_0000 + exc_ret);
+            self.exceptionTaken(@intFromEnum(Exception.usagefault));
+            return;
+        }
+    }
+
+    fn takeReset(self: *Cpu) void {
+        var vector_table: u32 = @bitCast(self.readMemMappedReg(SCS.Regs.VTOR, 0));
+        vector_table &= 0x3fff_ff80;
+
+        self.regs[SP_MAIN] = vector_table & 0xffff_fffc;
+        self.regs[SP_PROC] = 0;
+
+        self.setRL(0xffff_ffff);
+        const tmp = self.readMemA(u32, vector_table + 4);
+        self.PC = tmp & 0xffff_fffe;
+        self.psr.t = (tmp & 1) == 1;
+        self.psr.setIT(0);
+        self.primask.pm = false;
+        self.faultmask.fm = false;
+        self.basepri.basepri = 0;
+        self.control.zero = false;
+        self.control.one = false;
+        self.resetSCSRegs();
+        for (0..self.exception_active.len) |i| {
+            self.exception_active[i] = 0;
+        }
+        self.clearExclusiveLocal();
+        self.clearEventRegister();
+    }
+
     memory: []u8 = undefined,
     mem_steam: std.io.FixedBufferStream([]u8) = undefined,
+
+    exception_active: [512]u8 = [1]u8{0} ** 512,
 
     regs: [16]u32 = [1]u32{0} ** 16,
     psr: PSR = PSR{},
@@ -574,47 +1427,6 @@ const Cpu = struct {
     control: CONTROL = CONTROL{},
 
     PC: u32 = 0,
-
-    const SYSTEM_CONTOL_SPACE = struct {
-        const START = 0xe000e000;
-        const STOP = 0xe000efff;
-        const Regs = struct {
-            const ICTR = 0xE000E004;
-            const ACTLR = 0xE000E008;
-            const CPUID = 0xE000ED00;
-            const ICSR = 0xE000ED04;
-            const VTOR = 0xE000ED08;
-            const AIRCR = 0xE000ED0C;
-            const SCR = 0xE000ED10;
-            const CCR = 0xE000ED14;
-            const SHPR1 = 0xE000ED18;
-            const SHPR2 = 0xE000ED1C;
-            const SHPR3 = 0xE000ED20;
-            const SHCSR = 0xE000ED24;
-            const CFSR = 0xE000ED28;
-            const HFSR = 0xE000ED2C;
-            const DFSR = 0xE000ED30;
-            const MMFAR = 0xE000ED34; 
-            const BFAR = 0xE000ED38;
-            const AFSR = 0xE000ED3C;
-            const CPACR = 0xE000ED88;
-            const STIR = 0xE000EF00;
-
-            const PID4 = 0xE000EFD0;
-            const PID5 = 0xE000EFD4;
-            const PID6 = 0xE000EFD8;
-            const PID7 = 0xE000EFDC;
-            const PID0 = 0xE000EFE0;
-            const PID1 = 0xE000EFE4;
-            const PID2 = 0xE000EFE8;
-            const PID3 = 0xE000EFEC;
-
-            const CID0 = 0xE000EFF0;
-            const CID1 = 0xE000EFF4;
-            const CID2 = 0xE000EFF8;
-            const CID3 = 0xE000EFFC;
-        };
-    };
 
     fn currentModeIsPrivileged(self: *Cpu) bool {
         return switch (self.getMode()) {
@@ -630,6 +1442,10 @@ const Cpu = struct {
 
     fn getMode(self: *Cpu) Mode {
         return self.mode;
+    }
+
+    fn setMode(self: *Cpu, mode: Mode) void {
+        self.mode = mode;
     }
 
     fn loadElf(
@@ -834,12 +1650,8 @@ const Cpu = struct {
         self.setReg(14, v);
     }
 
-    //fn getPCOfft_(self: *const Cpu) u32 {
-    //    return @truncate(self.decoder.stream.pos + 4);
-    //}
-
+    // use in exec loop
     fn setPC(self: *Cpu, ip: u32) void {
-        //std.debug.print("********> ip: 0x{x}\n", .{ip});
         //for inrecment at bottom
         if (self.decoder.on32) {
             self.PC = ip - 4;
@@ -853,57 +1665,90 @@ const Cpu = struct {
         return 0;
     }
 
+    fn translateAddress(self: *Cpu, addr: u32) u32 {
+        _ = self;
+        const MAP_SIZE = SAM.MB4;
+        if (addr >= SAM.code.begin and addr < (SAM.code.begin + MAP_SIZE)) {
+            return (addr - SAM.code.begin) + SAM.code.realbegin;
+        } else if (addr >= SAM.device_nonshared.begin and addr < (SAM.device_nonshared.begin + MAP_SIZE)) {
+            return (addr - SAM.device_nonshared.begin) + SAM.device_nonshared.realbegin;
+        } else if (addr >= SAM.device_shared.begin and addr < (SAM.device_shared.begin + MAP_SIZE)) {
+            return (addr - SAM.device_shared.begin) + SAM.device_shared.realbegin;
+        } else if (addr >= SAM.ram0.begin and addr < (SAM.ram0.begin + MAP_SIZE)) {
+            return (addr - SAM.ram0.begin) + SAM.ram0.realbegin;
+        } else if (addr >= SAM.ram1.begin and addr < (SAM.ram1.begin + MAP_SIZE)) {
+            return (addr - SAM.ram1.begin) + SAM.ram1.realbegin;
+        } else if (addr >= SAM.sram.begin and addr < (SAM.sram.begin + MAP_SIZE)) {
+            return (addr - SAM.sram.begin) + SAM.sram.realbegin;
+        } else if (addr >= SAM.peripheral.begin and addr < (SAM.peripheral.begin + MAP_SIZE)) {
+            return (addr - SAM.peripheral.begin) + SAM.peripheral.realbegin;
+        } else if (addr >= SAM.system.begin and addr < (SAM.system.begin + MAP_SIZE)) {
+            return (addr - SAM.system.begin) + SAM.system.realbegin;
+        }
+
+        //TODO raise busfault
+        unreachable;
+    }
+
     fn fetch(self: *Cpu) Instr {
-        return self.decoder.decode(self.PC % self.memory.len);
+        return self.decoder.decode(self.translateAddress(self.PC));
     }
 
-    fn readMemA(self: *Cpu, T: type, addr: usize) T {
+    fn readMemA(self: *Cpu, T: type, addrz: u32) T {
+        const addr = self.translateAddress(addrz);
         if (addr % @sizeOf(T) != 0) @panic("unaligned mem access!!");
         self.mem_steam.seekTo(addr % self.memory.len) catch unreachable;
         //TODO check endian
         return self.mem_steam.reader().readInt(T, self.decoder.endian) catch unreachable;
     }
 
-    fn writeMemA(self: *Cpu, T: type, addr: usize, val: T) void {
-        if (addr % @sizeOf(T) != 0) @panic("unaligned mem access!!");
-        self.mem_steam.seekTo(addr % self.memory.len) catch unreachable;
-        //TODO check endian
-        self.mem_steam.writer().writeInt(T, val, self.decoder.endian) catch unreachable;
-    }
-
-    fn readMemU(self: *Cpu, T: type, addr: usize) T {
-        self.mem_steam.seekTo(addr % self.memory.len) catch unreachable;
-        //TODO check endian
-        return self.mem_steam.reader().readInt(T, self.decoder.endian) catch unreachable;
-    }
-
-    fn writeMemU(self: *Cpu, T: type, addr: usize, val: T) void {
-        self.mem_steam.seekTo(addr % self.memory.len) catch unreachable;
-        //TODO check endian
-        self.mem_steam.writer().writeInt(T, val, self.decoder.endian) catch unreachable;
-    }
-
-    fn readMemA_Unpriv(self: *Cpu, T: type, addr: usize) T {
-        if (addr % @sizeOf(T) != 0) @panic("unaligned mem access!!");
-        self.mem_steam.seekTo(addr % self.memory.len) catch unreachable;
-        //TODO check endian
-        return self.mem_steam.reader().readInt(T, self.decoder.endian) catch unreachable;
-    }
-
-    fn writeMemA_Unpriv(self: *Cpu, T: type, addr: usize, val: T) void {
+    fn writeMemA(self: *Cpu, T: type, addrz: u32, val: T) void {
+        const addr = self.translateAddress(addrz);
         if (addr % @sizeOf(T) != 0) @panic("unaligned mem access!!");
         self.mem_steam.seekTo(addr % self.memory.len) catch unreachable;
         //TODO check endian
         self.mem_steam.writer().writeInt(T, val, self.decoder.endian) catch unreachable;
     }
 
-    fn readMemU_Unpriv(self: *Cpu, T: type, addr: usize) T {
+    fn readMemU(self: *Cpu, T: type, addrz: u32) T {
+        const addr = self.translateAddress(addrz);
         self.mem_steam.seekTo(addr % self.memory.len) catch unreachable;
         //TODO check endian
         return self.mem_steam.reader().readInt(T, self.decoder.endian) catch unreachable;
     }
 
-    fn writeMemU_Unpriv(self: *Cpu, T: type, addr: usize, val: T) void {
+    fn writeMemU(self: *Cpu, T: type, addrz: u32, val: T) void {
+        const addr = self.translateAddress(addrz);
+        self.mem_steam.seekTo(addr % self.memory.len) catch unreachable;
+        //TODO check endian
+        self.mem_steam.writer().writeInt(T, val, self.decoder.endian) catch unreachable;
+    }
+
+    fn readMemA_Unpriv(self: *Cpu, T: type, addrz: u32) T {
+        const addr = self.translateAddress(addrz);
+        if (addr % @sizeOf(T) != 0) @panic("unaligned mem access!!");
+        self.mem_steam.seekTo(addr % self.memory.len) catch unreachable;
+        //TODO check endian
+        return self.mem_steam.reader().readInt(T, self.decoder.endian) catch unreachable;
+    }
+
+    fn writeMemA_Unpriv(self: *Cpu, T: type, addrz: u32, val: T) void {
+        const addr = self.translateAddress(addrz);
+        if (addr % @sizeOf(T) != 0) @panic("unaligned mem access!!");
+        self.mem_steam.seekTo(addr % self.memory.len) catch unreachable;
+        //TODO check endian
+        self.mem_steam.writer().writeInt(T, val, self.decoder.endian) catch unreachable;
+    }
+
+    fn readMemU_Unpriv(self: *Cpu, T: type, addrz: u32) T {
+        const addr = self.translateAddress(addrz);
+        self.mem_steam.seekTo(addr % self.memory.len) catch unreachable;
+        //TODO check endian
+        return self.mem_steam.reader().readInt(T, self.decoder.endian) catch unreachable;
+    }
+
+    fn writeMemU_Unpriv(self: *Cpu, T: type, addrz: u32, val: T) void {
+        const addr = self.translateAddress(addrz);
         self.mem_steam.seekTo(addr % self.memory.len) catch unreachable;
         //TODO check endian
         self.mem_steam.writer().writeInt(T, val, self.decoder.endian) catch unreachable;
@@ -2310,7 +3155,14 @@ const Cpu = struct {
 
     fn cps(self: *Cpu) void {
         if (self.currentModeIsPrivileged()) {
-            const a = @as(packed struct(u8) { affectfault: bool, affectpri: bool, z1: bool, z2: bool, disable: bool, r: i3 }, @bitCast(@as(u8, @truncate(self.decoder.current))));
+            const a = @as(packed struct(u32) { //
+                affectfault: bool,
+                affectpri: bool,
+                _1: bool,
+                _2: bool,
+                disable: bool,
+                _3: u27,
+            }, @bitCast(self.decoder.current));
             if (!a.disable) {
                 if (a.affectpri) self.primask.pm = false;
                 if (a.affectfault) self.faultmask.fm = false;
@@ -6982,7 +7834,8 @@ const Cpu = struct {
 
 var cpu = Cpu{};
 
-var mem_buf: [1024 * 1024 * 10]u8 = undefined;
+// 32mb memory
+var mem_buf: [1024 * 1024 * 32]u8 = undefined;
 
 fn testStuff(config_path: []const u8) !void {
     std.debug.print("testing with file: {s}........\n", .{config_path});
@@ -7109,6 +7962,23 @@ fn testStuff(config_path: []const u8) !void {
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 
 pub fn main() !void {
+    try cpu.init(mem_buf[0..]);
+    cpu.takeReset();
+    //try cpu.loadElf(elf_path);
+
+    while (true)
+    //for (0..45) |_|
+    {
+        const i = cpu.fetch();
+        //std.debug.print("--: {}\n", .{i});
+        //std.debug.print("last in it: {}\n", .{cpu.psr.getIT().last()});
+        cpu.exec(i);
+
+        //cpu.printRegisters();
+    }
+}
+
+pub fn maintt() !void {
     var args = try std.process.ArgIterator.initWithAllocator(gpa.allocator());
     _ = args.next();
 
