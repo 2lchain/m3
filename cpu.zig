@@ -971,24 +971,24 @@ const Cpu = struct {
                     const addr = 0xE000E010;
                     /// 0: the counter is disabled
                     ///  1: the counter will operate in a multi-shot manner.
-                    enable: bool,
+                    enable: bool = false,
                     /// If 1, counting down to 0 will cause the SysTick exception to
                     /// be pended. Clearing the SysTick Current Value register by a
                     /// register write in software will not cause SysTick to be
                     /// pended.
-                    tickint: bool,
+                    tickint: bool = false,
                     /// 0: clock source is (optional) external reference clock
                     ///  1: core clock used for SysTick
                     ///  If no external clock provided, this bit will read as 1 and
                     /// ignore writes.
-                    clcksource: bool,
-                    _1: u13,
+                    clcksource: bool = false,
+                    _1: u13 = 0,
                     /// Returns 1 if timer counted to 0 since last time this register
                     /// was read. COUNTFLAG is set by a count transition from 1
                     /// => 0. COUNTFLAG is cleared on read or by a write to the
                     /// Current Value register.
-                    countflag: bool,
-                    _2: u15,
+                    countflag: bool = false,
+                    _2: u15 = 0,
                 };
 
                 const SYST_RVR = packed struct(u32) {
@@ -1201,12 +1201,13 @@ const Cpu = struct {
             attr: Attr = .{},
         };
 
-        const code = Map{ //
-            .begin = 0x00000000,
+        const system = Map{ //
+            .begin = 0xE0000000,
+            .end = 0xFFFFFFFF,
             .realbegin = 0,
-            .end = 0x1FFFFFFF,
-            .attr = .{ .executable = true, .readable = true, .writable = true },
+            .attr = .{ .executable = false, .readable = true, .writable = true },
         };
+
         const sram = Map{ //
             .begin = 0x20000000,
             .realbegin = MB4,
@@ -1243,11 +1244,12 @@ const Cpu = struct {
             .realbegin = MB4 * 6,
             .attr = .{ .executable = false, .readable = true, .writable = true },
         };
-        const system = Map{ //
-            .begin = 0xE0000000,
-            .end = 0xFFFFFFFF,
+
+        const code = Map{ //
+            .begin = 0x00000000,
             .realbegin = MB4 * 7,
-            .attr = .{ .executable = false, .readable = true, .writable = true },
+            .end = 0x1FFFFFFF,
+            .attr = .{ .executable = true, .readable = true, .writable = true },
         };
 
         const Layout: [8]Map = .{ //
@@ -1258,26 +1260,23 @@ const Cpu = struct {
     const PRIORITY_BITS = 4;
 
     // offset in 4 bytes
-    fn readMemMappedReg(self: *Cpu, T: type, offset: u32) T {
+    inline fn readMemMappedReg(self: *Cpu, T: type, offset: u32) *T {
+        comptime if (@import("builtin").cpu.arch.endian() != .little) @compileError("big endian cpu detected!!!");
         if (@hasDecl(T, "addr")) {
-            const addr = self.translateAddress(T.addr + (offset * 4), .{ .readable = true }) catch unreachable;
-            self.mem_steam.seekTo(addr) catch unreachable;
-            const reg = self.mem_steam.reader().readInt(u32, .little) catch |e| {
-                std.debug.print("error: {!} addr: {x}\n", .{ e, addr });
-                unreachable;
-            };
-            return @bitCast(reg);
+            if (self.translateAddress(T.addr + (offset * 4), .{ .readable = true })) |addr| {
+                return @alignCast(@ptrCast(&self.memory[addr]));
+            } else |_| unreachable;
         } else @compileError(std.fmt.comptimePrint("{s} has no addr decr.\n", .{@typeName(T)}));
     }
 
     // offset in 4 bytes
-    fn writeMemMappedReg(self: *Cpu, T: type, value: T, offset: u32) void {
-        if (@hasDecl(T, "addr")) {
-            const addr = self.translateAddress(T.addr + (offset * 4), .{ .readable = true }) catch unreachable;
-            self.mem_steam.seekTo(addr) catch unreachable;
-            self.mem_steam.writer().writeInt(u32, @bitCast(value), .little) catch unreachable;
-        } else @compileError(std.fmt.comptimePrint("{s} has no addr field.\n", .{@typeName(T)}));
-    }
+    //fn writeMemMappedReg(self: *Cpu, T: type, value: T, offset: u32) void {
+    //    if (@hasDecl(T, "addr")) {
+    //        const addr = self.translateAddress(T.addr + (offset * 4), .{ .readable = true }) catch unreachable;
+    //        self.mem_steam.seekTo(addr) catch unreachable;
+    //        self.mem_steam.writer().writeInt(u32, @bitCast(value), .little) catch unreachable;
+    //    } else @compileError(std.fmt.comptimePrint("{s} has no addr field.\n", .{@typeName(T)}));
+    //}
 
     fn updateSCSRegs(self: *Cpu) void {
         _ = self;
@@ -1348,7 +1347,7 @@ const Cpu = struct {
     fn getExecutionPriority(self: *Cpu) i16 {
         var highestpri: i16 = 256;
         var boostedpri: i16 = 256;
-        for (2..15) |e| {
+        for (2..48) |e| {
             if (self.exception_active[e] == 1) {
                 const pri = self.getPriorityGrouping( //
                     self.getExeptionPriority(@intCast(e)));
@@ -1378,7 +1377,7 @@ const Cpu = struct {
     fn returnAddress(self: *Cpu, except: u9, precise: bool) u32 {
         const incr: u32 = if (self.on32) 4 else 2;
         const exception: Exception = @enumFromInt(except);
-        return switch (exception) {
+        const r = switch (exception) {
             .___ghost => unreachable,
             .reset => unreachable,
             .svccall, .pendsv, .systick, .nmi => self.current_instr_addr + incr,
@@ -1390,6 +1389,8 @@ const Cpu = struct {
             else
                 unreachable,
         };
+        std.debug.print("========> curr: {x}, return address: {x}, pc: {x}\n", .{ self.current_instr_addr, r, self.PC });
+        return r;
     }
 
     fn setEventRegister(self: *Cpu) void {
@@ -1402,32 +1403,84 @@ const Cpu = struct {
         //TODO
     }
 
-    fn exceptionEntry(self: *Cpu, ex: u9, precise: bool) !void {
+    fn exceptionEntry(self: *Cpu, ex: u9, precise: bool, usepc: bool) !void {
         //check escaltion
         const expri = self.getExecutionPriority();
         const intpri = self.getPriorityGrouping(self.getExeptionPriority(ex)).group;
 
+        std.debug.print("EXCEPTION: expri: {} inpri: {} exep: {}\n", .{ expri, intpri, @as(Exception, @enumFromInt(ex)) });
+
+        const scr = self.readMemMappedReg(SCS.Regs.SCR, 0);
         if (ex < 16 and expri > -1) {
             var reg = self.readMemMappedReg(SCS.Regs.SHCSR, 0);
 
-            try self.pushStack(ex, precise);
+            const icsr = self.readMemMappedReg(SCS.Regs.ICSR, 0);
 
             const escalate = switch (@as(Exception, @enumFromInt(ex))) {
                 .memmanage => !reg.memfaultena,
                 .busfault => !reg.busfaultena,
                 .usagefault => !reg.usgfaultena,
-                .svccall, .debugmonitor, .pendsv, .systick => false,
+                .svccall, .debugmonitor, .pendsv, .systick, .hardfault, .nmi => false,
                 // TODO
                 else => unreachable,
             };
 
-            if (escalate or intpri <= expri) {
+            if (escalate) {
+                try self.pushStack(ex, if (usepc) self.PC else self.returnAddress(ex, precise));
                 try self.exceptionTaken(@intFromEnum(Exception.hardfault));
+            } else if (expri <= intpri) {
+                // premption cant happen
+
+                switch (@as(Exception, @enumFromInt(ex))) {
+                    // unreachable
+                    .nmi, //
+                    .hardfault,
+                    .memmanage,
+                    .busfault,
+                    .usagefault,
+                    .debugmonitor,
+                    => {
+                        try self.pushStack(ex, if (usepc) self.PC else self.returnAddress(ex, precise));
+                        try self.exceptionTaken(@intFromEnum(Exception.hardfault));
+                    },
+                    .svccall => {
+                        reg.svccallpended = true;
+                        if (scr.sevonpend) {
+                            self.eventhappened = true;
+                        }
+                        return;
+                    },
+                    .pendsv => {
+                        icsr.pendsvclr = false;
+                        icsr.pendsvset = true;
+                        if (scr.sevonpend) {
+                            self.eventhappened = true;
+                        }
+                        return;
+                    },
+                    .systick => {
+                        icsr.pendstclr = false;
+                        icsr.pendstset = true;
+                        if (scr.sevonpend) {
+                            self.eventhappened = true;
+                        }
+                        return;
+                    },
+                    // TODO
+                    else => unreachable,
+                }
             } else {
+                // preempt
+                try self.pushStack(ex, if (usepc) self.PC else self.returnAddress(ex, precise));
                 try self.exceptionTaken(ex);
             }
 
+            self.eventhappened = true;
             switch (@as(Exception, @enumFromInt(ex))) {
+                .nmi => {
+                    icsr.nmipendset = false;
+                },
+                .hardfault => {},
                 .memmanage => {
                     reg.memfaultact = true;
                     reg.memfaultpended = false;
@@ -1447,30 +1500,37 @@ const Cpu = struct {
                 .debugmonitor => {},
                 .pendsv => {
                     reg.pendsvact = true;
+                    icsr.pendsvclr = true;
+                    icsr.pendsvset = false;
                 },
                 .systick => {
                     reg.systickact = true;
+                    icsr.pendstclr = true;
+                    icsr.pendstset = false;
                 },
                 else => {},
             }
-
-            self.writeMemMappedReg(SCS.Regs.SHCSR, reg, 0);
             return error.ExceptionEntered;
         } else if (ex >= 16 and expri > -1) {
             const intr: u9 = @intCast(ex - 16);
-            //std.debug.print("intri: {} expri: {}\n", .{intpri, expri});
+
             if (expri <= intpri) {
                 // pend it
+                if (scr.sevonpend) {
+                    self.eventhappened = true;
+                }
+                std.debug.print("....pend \n", .{});
             } else {
-                try self.pushStack(ex, precise);
+                try self.pushStack(ex, if (usepc) self.PC else self.returnAddress(ex, precise));
                 try self.exceptionTaken(ex);
-
                 self.nvicPend(intr, false);
                 self.nvicAtivate(intr, true);
+                self.eventhappened = true;
                 return error.ExceptionEntered;
             }
         } else {
             //lockup state TODO
+
             std.debug.print("FATAL: cpu lock up reached...\n", .{});
             std.process.exit(1);
         }
@@ -1478,11 +1538,13 @@ const Cpu = struct {
 
     fn getPendingException(self: *Cpu) ?u9 {
         var exception: ?u9 = null;
-        var priority: PriorityGroup = .{.group = 256, .sub = 256 };
+        var priority: PriorityGroup = .{ .group = 256, .sub = 256 };
         var pri: PriorityGroup = undefined;
         var exc: u9 = undefined;
 
         const faultreg = self.readMemMappedReg(SCS.Regs.SHCSR, 0);
+
+        const icsr = self.readMemMappedReg(SCS.Regs.ICSR, 0);
 
         if (faultreg.memfaultpended) {
             exception = @intFromEnum(Exception.memmanage);
@@ -1518,6 +1580,7 @@ const Cpu = struct {
                 }
             }
         }
+
         if (faultreg.svccallpended) {
             exc = @intFromEnum(Exception.svccall);
             pri = self.getPriorityGrouping(self.getExeptionPriority(exc));
@@ -1533,17 +1596,46 @@ const Cpu = struct {
             }
         }
 
-        const pendreg = self.readMemMappedReg(SCS.Regs.NVIC.NVIC_ICPR, 0);
+        if (!icsr.pendsvclr and icsr.pendsvset) {
+            exc = @intFromEnum(Exception.pendsv);
+            pri = self.getPriorityGrouping(self.getExeptionPriority(exc));
+
+            if (pri.group < priority.group) {
+                priority = pri;
+                exception = exc;
+            } else if (pri.group == priority.group) {
+                if (pri.sub < priority.sub) {
+                    priority = pri;
+                    exception = exc;
+                }
+            }
+        }
+
+        if (!icsr.pendstclr and icsr.pendstset) {
+            exc = @intFromEnum(Exception.systick);
+            pri = self.getPriorityGrouping(self.getExeptionPriority(exc));
+
+            if (pri.group < priority.group) {
+                priority = pri;
+                exception = exc;
+            } else if (pri.group == priority.group) {
+                if (pri.sub < priority.sub) {
+                    priority = pri;
+                    exception = exc;
+                }
+            }
+        }
+
+        //const pendreg = self.readMemMappedReg(SCS.Regs.NVIC.NVIC_ICPR, 0);
         const pendreg2 = self.readMemMappedReg(SCS.Regs.NVIC.NVIC_ISPR, 0);
 
-        const enabreg = self.readMemMappedReg(SCS.Regs.NVIC.NVIC_ICER, 0);
+        //const enabreg = self.readMemMappedReg(SCS.Regs.NVIC.NVIC_ICER, 0);
         const enabreg2 = self.readMemMappedReg(SCS.Regs.NVIC.NVIC_ISER, 0);
 
-        //std.debug.print("==> {} {} {} {}\n", .{pendreg2.back, enabreg2.back, enabreg.back, pendreg.back});
-
-        for (0..32) |i| {
-            if ((!pendreg.check(@truncate(i)) and pendreg2.check(@truncate(i))) and //
-                (!enabreg.check(@truncate(i)) and enabreg2.check(@truncate(i))))
+        //8 external interrupts TODO could be fewer
+        for (0..8) |i| {
+            if (pendreg2.check(@truncate(i)) and //
+                (enabreg2.check(@truncate(i))))
             {
                 exc = @truncate(i + 16);
                 pri = self.getPriorityGrouping(self.getExeptionPriority(exc));
@@ -1559,6 +1651,12 @@ const Cpu = struct {
                 }
             }
         }
+
+        // icsr.vectpending TODO
+        //const scr = self.readMemMappedReg(SCS.Regs.SCR, 0);
+        //if (scr.sevonpend) {
+        //    self.eventhappened = true;
+        //}
 
         return exception;
     }
@@ -1593,11 +1691,9 @@ const Cpu = struct {
 
         var pendreg = self.readMemMappedReg(SCS.Regs.NVIC.NVIC_ICER, x.reg);
         if (yes) pendreg.clr(x.idx) else pendreg.set(x.idx);
-        self.writeMemMappedReg(SCS.Regs.NVIC.NVIC_ICER, pendreg, x.reg);
 
         var pendreg2 = self.readMemMappedReg(SCS.Regs.NVIC.NVIC_ISER, x.reg);
         if (yes) pendreg2.set(x.idx) else pendreg2.clr(x.idx);
-        self.writeMemMappedReg(SCS.Regs.NVIC.NVIC_ISER, pendreg2, x.reg);
     }
 
     fn nvicPend(self: *Cpu, intr: u9, yes: bool) void {
@@ -1608,11 +1704,9 @@ const Cpu = struct {
 
         var pendreg = self.readMemMappedReg(SCS.Regs.NVIC.NVIC_ICPR, x.reg);
         if (yes) pendreg.clr(x.idx) else pendreg.set(x.idx);
-        self.writeMemMappedReg(SCS.Regs.NVIC.NVIC_ICPR, pendreg, x.reg);
 
         var pendreg2 = self.readMemMappedReg(SCS.Regs.NVIC.NVIC_ISPR, x.reg);
         if (yes) pendreg2.set(x.idx) else pendreg2.clr(x.idx);
-        self.writeMemMappedReg(SCS.Regs.NVIC.NVIC_ISPR, pendreg2, x.reg);
     }
 
     fn nvicAtive(self: *Cpu, intr: u9) void {
@@ -1631,18 +1725,15 @@ const Cpu = struct {
         }, @bitCast(intr));
         var actreg = self.readMemMappedReg(SCS.Regs.NVIC.NVIC_IABR, x.reg);
         if (yes) actreg.set(x.idx) else actreg.clr(x.idx);
-        self.writeMemMappedReg(SCS.Regs.NVIC.NVIC_IABR, actreg, x.reg);
     }
 
     fn exceptionTaken(self: *Cpu, exept: u9) !void {
         var vector_table = self.readMemMappedReg(SCS.Regs.VTOR, 0);
         const tmp = try self.readMemA(u32, (vector_table.getOffset()) + 4 * exept);
-        self.setPC(tmp & 0xffff_fffe);
+        std.debug.print("   HANDLER: {x} SP: {}\n", .{ tmp & 0xffff_fffe, self.getReg(SP_REG) });
+        //self.setPC(tmp & 0xffff_fffe);
+        self.PC = tmp & 0xffff_fffe;
         self.setMode(.handler);
-        //std.debug.print("PC: =====> {x}\n", .{
-        //    self.PC
-        //});
-        //std.process.exit(1);
         self.psr.exception = exept;
         self.psr.t = (tmp & 1) == 1;
         self.psr.setIT(0);
@@ -1682,12 +1773,11 @@ const Cpu = struct {
                 .systick => reg.systickact = false,
                 else => {},
             }
-
-            self.writeMemMappedReg(SCS.Regs.SHCSR, reg, 0);
         }
     }
 
-    fn pushStack(self: *Cpu, execption: u9, precise: bool) !void {
+    fn pushStack(self: *Cpu, execption: u9, return_addr: u32) !void {
+        _ = execption;
         const ccr = self.readMemMappedReg(SCS.Regs.CCR, 0);
         const curr_sp_index: usize = if (self.control.one and self.getMode() == .thread)
             SP_PROC //
@@ -1707,7 +1797,7 @@ const Cpu = struct {
         try self.writeMemA(u32, frameptr + 12, self.getReg(3));
         try self.writeMemA(u32, frameptr + 16, self.getReg(12));
         try self.writeMemA(u32, frameptr + 20, self.getRL());
-        try self.writeMemA(u32, frameptr + 24, self.returnAddress(execption, precise));
+        try self.writeMemA(u32, frameptr + 24, return_addr);
         var psr = self.psr;
         psr.a = frameptralign;
         try self.writeMemA(u32, frameptr + 28, @bitCast(psr));
@@ -1762,18 +1852,16 @@ const Cpu = struct {
         if (self.exception_active[returning_exception_number] == 0) {
             self.deActivate(returning_exception_number);
             cfsr.usage_fault.invpc = true;
-            self.writeMemMappedReg(SCS.Regs.CFSR, cfsr, 0);
             self.setRL(0xf000_0000 + @as(u32, exc_ret));
-            try self.exceptionEntry(@intFromEnum(Exception.usagefault), true);
+            try self.exceptionEntry(@intFromEnum(Exception.usagefault), true, false);
         }
         switch (exc_ret & 0b1111) {
             1 => {
                 if (nested_activation == 1) {
                     self.deActivate(returning_exception_number);
                     cfsr.usage_fault.invpc = true;
-                    self.writeMemMappedReg(SCS.Regs.CFSR, cfsr, 0);
                     self.setRL(0xf000_0000 + @as(u32, exc_ret));
-                    try self.exceptionEntry(@intFromEnum(Exception.usagefault), true);
+                    try self.exceptionEntry(@intFromEnum(Exception.usagefault), true, false);
                 }
                 frame_ptr = self.regs[SP_MAIN];
                 self.setMode(.handler);
@@ -1783,9 +1871,8 @@ const Cpu = struct {
                 if (nested_activation != 1 and !ccr.nonebasethrdena) {
                     self.deActivate(returning_exception_number);
                     cfsr.usage_fault.invpc = true;
-                    self.writeMemMappedReg(SCS.Regs.CFSR, cfsr, 0);
                     self.setRL(0xf000_0000 + @as(u32, exc_ret));
-                    try self.exceptionEntry(@intFromEnum(Exception.usagefault), true);
+                    try self.exceptionEntry(@intFromEnum(Exception.usagefault), true, false);
                 }
                 frame_ptr = self.regs[if (v == 0b1001) SP_MAIN else SP_PROC];
                 self.setMode(.thread);
@@ -1794,11 +1881,15 @@ const Cpu = struct {
             else => {
                 self.deActivate(returning_exception_number);
                 cfsr.usage_fault.invpc = true;
-                self.writeMemMappedReg(SCS.Regs.CFSR, cfsr, 0);
                 self.setRL(0xf000_0000 + @as(u32, exc_ret));
-                try self.exceptionEntry(@intFromEnum(Exception.usagefault), true);
+                try self.exceptionEntry(@intFromEnum(Exception.usagefault), true, false);
             },
         }
+
+        std.debug.print("EXCEPTION RETURN: {} sp: {}\n", .{ //
+            returning_exception_number,
+            frame_ptr,
+        });
 
         self.deActivate(returning_exception_number);
         try self.popStack(frame_ptr, @truncate(exc_ret));
@@ -1806,19 +1897,19 @@ const Cpu = struct {
         if (self.getMode() == .handler and self.psr.exception == 0) {
             self.deActivate(returning_exception_number);
             cfsr.usage_fault.invpc = true;
-            self.writeMemMappedReg(SCS.Regs.CFSR, cfsr, 0);
-            try self.pushStack(@intFromEnum(Exception.usagefault), true);
+
+            try self.pushStack(@intFromEnum(Exception.usagefault), self.returnAddress(@intFromEnum(Exception.usagefault), true));
             self.setRL(0xf000_0000 + @as(u32, exc_ret));
-            try self.exceptionEntry(@intFromEnum(Exception.usagefault), true);
+            try self.exceptionEntry(@intFromEnum(Exception.usagefault), true, false);
         }
 
         if (self.getMode() == .thread and self.psr.exception != 0) {
             self.deActivate(returning_exception_number);
             cfsr.usage_fault.invpc = true;
-            self.writeMemMappedReg(SCS.Regs.CFSR, cfsr, 0);
-            try self.pushStack(@intFromEnum(Exception.usagefault), true);
+            try self.pushStack(@intFromEnum(Exception.usagefault), self.returnAddress(@intFromEnum(Exception.usagefault), true));
+            //try self.pushStack(@intFromEnum(Exception.usagefault), true);
             self.setRL(0xf000_0000 + @as(u32, exc_ret));
-            try self.exceptionEntry(@intFromEnum(Exception.usagefault), true);
+            try self.exceptionEntry(@intFromEnum(Exception.usagefault), true, false);
         }
 
         self.clearExclusiveLocal();
@@ -1831,6 +1922,7 @@ const Cpu = struct {
             //TODO ??
             //try self.pushStack(returning_exception_number, true);
             self.sleepOnExit();
+            @panic("sleep on exit not implemented");
         }
     }
 
@@ -1853,7 +1945,8 @@ const Cpu = struct {
     }
 
     fn takeReset(self: *Cpu, adjust: bool) !void {
-        var vector_table: u32 = @bitCast(self.readMemMappedReg(SCS.Regs.VTOR, 0));
+        self.mode = .thread;
+        var vector_table: u32 = @bitCast(self.readMemMappedReg(SCS.Regs.VTOR, 0).*);
         vector_table &= 0x3fff_ff80;
 
         self.regs[SP_MAIN] = try self.readMemA(u32, vector_table) & 0xffff_fffc;
@@ -1903,18 +1996,26 @@ const Cpu = struct {
     PC: u32 = 0,
     on32: bool = false,
 
+    eventhappened: bool = false,
+
+    uartrxfifo: [32]u8 = undefined,
+    uartrxidx: u8 = 0,
+    uartrxmtx: std.Thread.Mutex = .{},
+    uartrxint: bool = false,
+
     fn currentModeIsPrivileged(self: *Cpu) bool {
-        return switch (self.getMode()) {
+        const t = switch (self.getMode()) {
             .handler => true,
-            else => return self.control.zero,
+            else => self.control.zero,
         };
+        return t;
     }
 
-    fn getMode(self: *Cpu) Mode {
+    inline fn getMode(self: *Cpu) Mode {
         return self.mode;
     }
 
-    fn setMode(self: *Cpu, mode: Mode) void {
+    inline fn setMode(self: *Cpu, mode: Mode) void {
         self.mode = mode;
     }
 
@@ -1930,7 +2031,7 @@ const Cpu = struct {
         while (try ph_iter.next()) |ph| {
             if (ph.p_type != elf.PT_LOAD) continue;
             try elf_file.seekTo(ph.p_offset);
-            const n = try elf_file.reader().readAll(self.memory[ph.p_vaddr..][0..ph.p_filesz]);
+            const n = try elf_file.reader().readAll(self.memory[self.translateAddress(@intCast(ph.p_vaddr), .{}) catch unreachable ..][0..ph.p_filesz]);
             std.debug.assert(n == ph.p_filesz);
         }
 
@@ -1991,6 +2092,8 @@ const Cpu = struct {
         self.regs = [1]u32{0} ** 16;
 
         self.psr.t = true;
+
+        self.psr.exception = 0;
     }
 
     fn exclusiveMonitorsPass(self: *Cpu, addr: u32, n: u32) bool {
@@ -2130,7 +2233,9 @@ const Cpu = struct {
         }
     }
 
-    fn translateAddress(self: *Cpu, addr: u32, attr: SAM.Map.Attr) !u32 {
+    const MemoryFault = error{NotExecutable};
+
+    fn translateAddress(self: *Cpu, addr: u32, attr: SAM.Map.Attr) anyerror!u32 {
         const z = @as(packed struct(u32) { offt: u22, _1: u7, reg: u3 }, @bitCast(addr));
         const offset = z.offt;
         const region = SAM.Layout[z.reg];
@@ -2138,12 +2243,13 @@ const Cpu = struct {
         if (attr.executable and !region.attr.executable) {
             //std.debug.print("not executable: attr: {}, expected: {}\n", .{ region.attr, attr });
             std.debug.print("Return address: {x}\n", .{self.returnAddress(@intFromEnum(Exception.memmanage), true)});
-            try self.exceptionEntry(@intFromEnum(Exception.memmanage), true);
+            try self.exceptionEntry(@intFromEnum(Exception.memmanage), true, false);
             std.debug.print("enter memmanage.... {x}\n", .{self.PC});
 
             return error.NotExecutable;
         }
 
+        // std.debug.print("---- vaddr: {x}, region: {} paddr: {x}\n", .{ addr, z.reg, region.realbegin + offset });
         return region.realbegin + offset;
     }
 
@@ -2151,14 +2257,14 @@ const Cpu = struct {
         if (self.psr.t == false) {
             var fsr = self.readMemMappedReg(SCS.Regs.CFSR, 0);
             fsr.usage_fault = .{ .invstate = true };
-            self.writeMemMappedReg(SCS.Regs.CFSR, fsr, 0);
-            try self.exceptionEntry(@intFromEnum(Exception.usagefault), true);
+            try self.exceptionEntry(@intFromEnum(Exception.usagefault), true, false);
         }
         const addr = try self.translateAddress(self.PC, .{ .executable = true });
-        const hw = try self.readMemA(u16, addr);
+        try self.checkAlignment(u16, addr);
+        const hw = try self.readMemInner(u16, addr);
         if (Decoder.is32bit(hw)) {
             self.on32 = true;
-            const lw = try self.readMemA(u16, addr + 2);
+            const lw = try self.readMemInner(u16, addr + 2);
             return self.decoder.decode((@as(u32, hw) << 16) | lw, true);
         }
 
@@ -2170,29 +2276,273 @@ const Cpu = struct {
         if (addr % @sizeOf(T) != 0) {
             var fsr = self.readMemMappedReg(SCS.Regs.CFSR, 0);
             fsr.usage_fault = .{ .unaligned = true };
-            self.writeMemMappedReg(SCS.Regs.CFSR, fsr, 0);
-            try self.exceptionEntry(@intFromEnum(Exception.usagefault), true);
+            try self.exceptionEntry(@intFromEnum(Exception.usagefault), true, false);
             return error.UnalignedAccess;
         }
     }
 
-    fn writeMemInner(self: *Cpu, T: type, addr: u32, val: T) !void {
-        const aircr = self.readMemMappedReg(SCS.Regs.AIRCR, 0);
+    fn sysWriteMemInner(self: *Cpu, T: type, addr: u32, val: T) void {
+        if (addr >= @as(u22, @truncate(SCS.Regs.NVIC.NVIC_ISER.addr)) //
+        and addr < @as(u22, @truncate(SCS.Regs.NVIC.NVIC_ICER.addr))) {
+            self.mem_steam.seekTo(addr + 0x80) catch unreachable;
+            self.mem_steam.writer().writeInt(T, ~val, .little) catch unreachable;
+        }
+
+        if (addr >= @as(u22, @truncate(SCS.Regs.NVIC.NVIC_ICER.addr)) //
+        and addr < @as(u22, @truncate(SCS.Regs.NVIC.NVIC_ISPR.addr))) {
+            self.mem_steam.seekTo(addr - 0x80) catch unreachable;
+            self.mem_steam.writer().writeInt(T, ~val, .little) catch unreachable;
+        }
+
+        if (addr >= @as(u22, @truncate(SCS.Regs.NVIC.NVIC_ISPR.addr)) //
+        and addr < @as(u22, @truncate(SCS.Regs.NVIC.NVIC_ICPR.addr))) {
+            self.mem_steam.seekTo(addr + 0x80) catch unreachable;
+            self.mem_steam.writer().writeInt(T, ~val, .little) catch unreachable;
+        }
+
+        if (addr >= @as(u22, @truncate(SCS.Regs.NVIC.NVIC_ICPR.addr)) //
+        and addr < @as(u22, @truncate(SCS.Regs.NVIC.NVIC_IABR.addr))) {
+            self.mem_steam.seekTo(addr - 0x80) catch unreachable;
+            self.mem_steam.writer().writeInt(T, ~val, .little) catch unreachable;
+        }
+
+        if (addr >= @as(u22, @truncate(SCS.Regs.NVIC.STIR.addr)) and //
+            addr < (@as(u22, @truncate(SCS.Regs.NVIC.STIR.addr + 4))))
+        {
+            const ptr = self.readMemMappedReg(SCS.Regs.CCR, 0);
+            if (!ptr.usersetmpend and !self.currentModeIsPrivileged()) {
+                //
+            } else {
+                self.mem_steam.seekTo(addr) catch unreachable;
+                self.mem_steam.writer().writeInt(T, val, .little) catch unreachable;
+                const stir = self.readMemMappedReg(SCS.Regs.NVIC.STIR, 0);
+                self.nvicPend(stir.intid, true);
+            }
+            return;
+        }
+
+        //sys
         self.mem_steam.seekTo(addr) catch unreachable;
-        if (aircr.big_endian) {
-            self.mem_steam.writer().writeInt(T, val, .big) catch unreachable;
+        self.mem_steam.writer().writeInt(T, val, .little) catch unreachable;
+
+        if (addr >= @as(u22, @truncate(SCS.Regs.ICSR.addr)) and //
+            addr < (@as(u22, @truncate(SCS.Regs.ICSR.addr + 4))))
+        {
+            const ptr = self.readMemMappedReg(SCS.Regs.ICSR, 0);
+            if (ptr.pendstclr) {
+                ptr.pendstset = false;
+            }
+            if (ptr.pendstset) {
+                ptr.pendstclr = false;
+            }
+
+            if (ptr.pendsvclr) {
+                ptr.pendsvset = false;
+            }
+            if (ptr.pendsvset) {
+                ptr.pendsvclr = false;
+            }
+        }
+    }
+
+    fn sysReadMemInner(self: *Cpu, T: type, addr: u32) T {
+        self.mem_steam.seekTo(addr) catch unreachable;
+        const v = self.mem_steam.reader().readInt(T, .little) catch unreachable;
+        if (addr >= @as(u22, @truncate(SCS.Regs.SysTick.SYST_CSR.addr)) and //
+            addr < (@as(u22, @truncate(SCS.Regs.SysTick.SYST_CSR.addr + 4))))
+        {
+            const ptr = self.readMemMappedReg(SCS.Regs.SysTick.SYST_CSR, 0);
+            ptr.countflag = false;
+        }
+        return v;
+    }
+
+    //Perip===========================================================
+
+    const UART = struct {
+        const base = SAM.peripheral.realbegin;
+        const DR = packed struct(u32) {
+            const offset = 0;
+            data: u8,
+            _1: u24,
+        };
+
+        const UARTCR = packed struct(u32) {
+            const offset = 0x030;
+            uarten: bool,
+            _1: u7,
+            txe: bool,
+            rxe: bool,
+            _2: u22,
+        };
+
+        const UARTIMSC = packed struct(u32) {
+            const offset = 0x038;
+            _1: u4,
+            rxim: bool,
+            txim: bool,
+            _2: u26,
+        };
+
+        const UARTLCR_H = packed struct(u32) {
+            const offset = 0x02C;
+            _1: u4,
+            fen: bool,
+            _2: u27,
+        };
+
+        const UARTIFLS = packed struct(u32) {
+            const offset = 0x034;
+            tx: u3,
+            rx: u3,
+            _1: u26,
+
+            fn getRxTriggerPoint(self: UARTIFLS, len: usize) usize {
+                return switch (self.rx) {
+                    0 => @divTrunc(len, 8),
+                    1 => @divTrunc(len, 4),
+                    2 => @divTrunc(len, 2),
+                    3 => @divTrunc(len * 3, 4),
+                    4 => @divTrunc(len * 7, 8),
+                    else => 0,
+                };
+            }
+        };
+    };
+
+    fn peripWriteMemInner(self: *Cpu, T: type, addr: u32, val: T) void {
+        const a = addr - UART.base;
+
+        //std.debug.print("-0000000000000> addr: {}\n", .{a});
+
+        const dr: *UART.DR = @alignCast(@ptrCast(&self.memory[UART.base + UART.DR.offset]));
+        const cr: *UART.UARTCR = @alignCast(@ptrCast(&self.memory[UART.base + UART.UARTCR.offset]));
+        const msc: *UART.UARTIMSC = @alignCast(@ptrCast(&self.memory[UART.base + UART.UARTIMSC.offset]));
+
+        _ = dr;
+        //_= cr;
+        _ = msc;
+
+        if (a >= UART.DR.offset and a < UART.DR.offset + 4) {
+            if (cr.txe and cr.uarten) {
+                std.debug.print("   uart char --> {c}\n", .{@as(u8, @truncate(val))});
+            }
+        }
+
+        //sys
+        self.mem_steam.seekTo(addr) catch unreachable;
+        self.mem_steam.writer().writeInt(T, val, .little) catch unreachable;
+
+        if (a >= UART.UARTCR.offset and a < UART.UARTCR.offset + 4) {
+            if (!cr.uarten) {
+                self.uartrxidx = 0;
+                self.uartrxint = false;
+            }
+        }
+    }
+
+    fn uartRXAddChar(self: *Cpu, char: u8) void {
+        const cr: *UART.UARTCR = @alignCast(@ptrCast(&self.memory[UART.base + UART.UARTCR.offset]));
+        if (!(cr.uarten and cr.rxe)) return;
+        self.uartrxmtx.lock();
+        defer self.uartrxmtx.unlock();
+        const ifls: *UART.UARTIFLS = @alignCast(@ptrCast(&self.memory[UART.base + UART.UARTIFLS.offset]));
+
+        const lcr_h: *UART.UARTLCR_H = @alignCast(@ptrCast(&self.memory[UART.base + UART.UARTLCR_H.offset]));
+
+        if (!lcr_h.fen) {
+            self.uartrxidx = 1;
+            self.uartrxfifo[self.uartrxidx] = char;
+            self.uartrxint = true;
+            return self.nvicPend(0, true);
+        }
+
+        if (self.uartrxidx < self.uartrxfifo.len) {
+            self.uartrxfifo[self.uartrxidx] = char;
+            self.uartrxidx += 1;
+        }
+
+        if (self.uartrxidx < ifls.getRxTriggerPoint(self.uartrxfifo.len)) {
+            self.uartrxint = false;
         } else {
-            self.mem_steam.writer().writeInt(T, val, .little) catch unreachable;
+            self.nvicPend(0, true);
+            self.uartrxint = true;
+        }
+    }
+
+    fn peripReadMemInner(self: *Cpu, T: type, addr: u32) T {
+        const a = addr - UART.base;
+
+        const dr: *UART.DR = @alignCast(@ptrCast(&self.memory[UART.base + UART.DR.offset]));
+        const cr: *UART.UARTCR = @alignCast(@ptrCast(&self.memory[UART.base + UART.UARTCR.offset]));
+        const msc: *UART.UARTIMSC = @alignCast(@ptrCast(&self.memory[UART.base + UART.UARTIMSC.offset]));
+        const ifls: *UART.UARTIFLS = @alignCast(@ptrCast(&self.memory[UART.base + UART.UARTIFLS.offset]));
+
+        _ = dr;
+        //_= cr;
+        _ = msc;
+
+        if (a >= UART.DR.offset and a < UART.DR.offset + 4) {
+            if (self.uartrxidx > 0 and self.uartrxidx <= self.uartrxfifo.len and cr.rxe and cr.uarten) {
+                self.uartrxmtx.lock();
+                defer self.uartrxmtx.unlock();
+
+                const lcr_h: *UART.UARTLCR_H = @alignCast(@ptrCast(&self.memory[UART.base + UART.UARTLCR_H.offset]));
+
+                if (!lcr_h.fen) {
+                    self.uartrxint = false;
+                    return self.uartrxfifo[0];
+                }
+
+                self.uartrxidx -= 1;
+                if (self.uartrxidx < ifls.getRxTriggerPoint(self.uartrxfifo.len)) {
+                    self.uartrxint = false;
+                } else {
+                    self.uartrxint = true;
+                    self.nvicPend(0, true);
+                }
+                return self.uartrxfifo[self.uartrxidx];
+            }
+        }
+
+        self.mem_steam.seekTo(addr) catch unreachable;
+        const v = self.mem_steam.reader().readInt(T, .little) catch unreachable;
+        return v;
+    }
+    //Perip==============================================================
+
+    fn writeMemInner(self: *Cpu, T: type, addr: u32, val: T) !void {
+        //sys
+        if (addr >= SAM.MB4 * 2 and addr < SAM.MB4 * 4) {
+            return self.peripWriteMemInner(T, addr, val);
+        } else if (addr < SAM.MB4) {
+            if (!self.currentModeIsPrivileged()) try self.exceptionEntry(@intFromEnum(Exception.memmanage), true, false);
+            return self.sysWriteMemInner(T, addr, val);
+        } else {
+            const aircr = self.readMemMappedReg(SCS.Regs.AIRCR, 0);
+            self.mem_steam.seekTo(addr) catch unreachable;
+            if (aircr.big_endian) {
+                self.mem_steam.writer().writeInt(T, val, .big) catch unreachable;
+            } else {
+                self.mem_steam.writer().writeInt(T, val, .little) catch unreachable;
+            }
         }
     }
 
     fn readMemInner(self: *Cpu, T: type, addr: u32) !T {
-        const aircr = self.readMemMappedReg(SCS.Regs.AIRCR, 0);
-        self.mem_steam.seekTo(addr) catch unreachable;
-        if (aircr.big_endian) {
-            return self.mem_steam.reader().readInt(T, .big) catch unreachable;
+        if (addr >= SAM.MB4 * 2 and addr < SAM.MB4 * 4) {
+            return self.peripReadMemInner(T, addr);
+        } else if (addr < SAM.MB4) {
+            if (!self.currentModeIsPrivileged()) try self.exceptionEntry(@intFromEnum(Exception.memmanage), true, false);
+            return self.sysReadMemInner(T, addr);
         } else {
-            return self.mem_steam.reader().readInt(T, .little) catch unreachable;
+            const aircr = self.readMemMappedReg(SCS.Regs.AIRCR, 0);
+            self.mem_steam.seekTo(addr) catch unreachable;
+            if (aircr.big_endian) {
+                return self.mem_steam.reader().readInt(T, .big) catch unreachable;
+            } else {
+                return self.mem_steam.reader().readInt(T, .little) catch unreachable;
+            }
         }
     }
 
@@ -2234,8 +2584,7 @@ const Cpu = struct {
             var ufsr = self.readMemMappedReg(SCS.Regs.CFSR, 0);
             if (ccr.unalign_trp) {
                 ufsr.usage_fault = .{ .unaligned = true };
-                self.writeMemMappedReg(SCS.Regs.CFSR, ufsr, 0);
-                try self.exceptionEntry(@intFromEnum(Exception.usagefault), true);
+                try self.exceptionEntry(@intFromEnum(Exception.usagefault), true, false);
             }
         }
     }
@@ -3496,6 +3845,13 @@ const Cpu = struct {
         if (self.conditionPassed()) {
             var a: u8 = @truncate(self.decoder.current);
             var addr = self.getReg(SP_REG);
+
+            var sp = addr;
+            if (self.decoder.current & 256 > 0) sp += 4;
+            sp += bitCount(u8, a) * 4;
+
+            self.setReg(SP_REG, sp);
+
             for (0..8) |i| {
                 if (a & 1 > 0) {
                     self.setReg(i, try self.readMemA(u32, addr));
@@ -3504,10 +3860,9 @@ const Cpu = struct {
                 a >>= 1;
             }
             if (self.decoder.current & 256 > 0) {
-                try self.loadWritePC(try self.readMemA(u32, addr));
-                addr += 4;
+                const v = try self.readMemA(u32, addr);
+                try self.loadWritePC(v);
             }
-            self.setReg(SP_REG, addr);
         }
     }
 
@@ -3576,6 +3931,7 @@ const Cpu = struct {
                 a >>= 1;
             }
             if (self.decoder.current & 256 > 0) {
+                std.debug.print("   r14: {x}\n", .{self.getReg(14)});
                 try self.writeMemA(u32, addr, self.getReg(14));
                 addr += 4;
             }
@@ -3692,12 +4048,14 @@ const Cpu = struct {
     }
 
     fn bT2(self: *Cpu) void {
-        const a = @as(packed struct(u32) { //
-            imm: i11,
-            r: u21,
-        }, @bitCast(self.decoder.current));
-        const imm32: i32 = (@as(i32, a.imm << 1));
-        self.branchWritePC(@as(u32, @bitCast(imm32)) + self.getPC());
+        if (self.conditionPassed()) {
+            const a = @as(packed struct(u32) { //
+                imm: i11,
+                r: u21,
+            }, @bitCast(self.decoder.current));
+            const imm32: i32 = (@as(i32, a.imm) << 1);
+            self.branchWritePC(@as(u32, @bitCast(imm32)) + self.getPC());
+        }
     }
 
     test "bt2" {
@@ -4613,10 +4971,7 @@ const Cpu = struct {
 
     fn @"undefined"(self: *Cpu) !void {
         std.debug.print("undefined. Enter usage fault...\n", .{});
-        //std.process.exit(0);
-        //unreachable;
-
-        try self.exceptionEntry(@intFromEnum(Exception.usagefault), true);
+        try self.exceptionEntry(@intFromEnum(Exception.usagefault), true, false);
     }
 
     fn sbfxT1(self: *Cpu) void {
@@ -5343,17 +5698,36 @@ const Cpu = struct {
     }
 
     fn yield(self: *Cpu) void {
-        _ = self;
+        //_ = self;
+        std.debug.print("yield-----------> exec priority: {}\n", .{self.getExecutionPriority()});
+        std.process.exit(1);
     }
 
     fn wfe(self: *Cpu) void {
-        std.debug.print("wfe FAIL ==============================================================\n", .{});
-        _ = self;
+        //std.debug.print("wfe FAIL ==============================================================\n", .{});
+        //_ = self;
+        self.eventhappened = false;
+        if (self.conditionPassed()) {
+            while (!self.eventhappened) {
+                std.Thread.sleep(std.time.ns_per_ms * 100);
+                self.sysTick();
+                if (self.getPendingException()) |_| return;
+                std.debug.print("wfe ....\n", .{});
+            }
+        }
     }
 
     fn wfi(self: *Cpu) void {
-        std.debug.print("wfi PASS ==============================================================\n", .{});
-        _ = self;
+        //std.debug.print("wfi PASS ==============================================================\n", .{});
+        //_ = self;
+        if (self.conditionPassed()) {
+            while (true) {
+                std.debug.print("wfi .... {} {}\n", .{ self.nvicEnabled(0), self.nvicPending(0) });
+                std.Thread.sleep(std.time.ns_per_ms * 100);
+                self.sysTick();
+                if (self.getPendingException()) |_| return;
+            }
+        }
     }
 
     fn sev(self: *Cpu) void {
@@ -5520,6 +5894,8 @@ const Cpu = struct {
 
             var address = self.getReg(SP_REG);
 
+            self.setReg(SP_REG, address + bitCount(u16, registers) * 4);
+
             for (0..15) |i| {
                 if (registers & 1 > 0) {
                     self.setReg(i, try self.readMemA(u32, address));
@@ -5531,10 +5907,7 @@ const Cpu = struct {
 
             if (registers & 1 > 0) {
                 try self.loadWritePC(try self.readMemA(u32, address));
-                address += 4;
             }
-
-            self.setReg(SP_REG, address);
         }
     }
 
@@ -5550,14 +5923,13 @@ const Cpu = struct {
             }, @bitCast(self.decoder.current));
 
             const address = self.getReg(SP_REG);
+            self.setReg(SP_REG, address + 4);
 
             if (a.rt == 15) {
                 try self.loadWritePC(try self.readMemA(u32, address));
             } else {
                 self.setReg(a.rt, try self.readMemA(u32, address));
             }
-
-            self.setReg(SP_REG, address + 4);
         }
     }
 
@@ -7924,7 +8296,7 @@ const Cpu = struct {
 
             if (op2 == 0) {
                 if (self.integerZeroDivideTrappingEnabled()) {
-                    try self.exceptionEntry(@intFromEnum(Exception.usagefault), true);
+                    try self.exceptionEntry(@intFromEnum(Exception.usagefault), true, false);
                 } else {
                     self.setReg(a.rd, 0);
                 }
@@ -7978,7 +8350,7 @@ const Cpu = struct {
 
             if (op2 == 0) {
                 if (self.integerZeroDivideTrappingEnabled()) {
-                    try self.exceptionEntry(@intFromEnum(Exception.usagefault), true);
+                    try self.exceptionEntry(@intFromEnum(Exception.usagefault), true, false);
                 } else {
                     self.setReg(a.rd, 0);
                 }
@@ -8041,7 +8413,7 @@ const Cpu = struct {
 
     fn svcT1(self: *Cpu) !void {
         if (self.conditionPassed()) {
-            try self.exceptionEntry(@intFromEnum(Exception.svccall), true);
+            try self.exceptionEntry(@intFromEnum(Exception.svccall), true, false);
         }
     }
 
@@ -8114,7 +8486,10 @@ const Cpu = struct {
 
     fn exec(self: *Cpu, instr: Instr) !void {
         self.current_instr_addr = self.PC;
-        //std.debug.print("instr: {} {x}\n", .{ instr, self.current_instr_addr });
+        if (self.current_instr_addr >= 0x93ec and self.current_instr_addr < 0x9416) {
+            self.printRegisters();
+        }
+        std.debug.print("instr: {} {x}\n", .{ instr, self.current_instr_addr });
         switch (instr) {
             //else => unreachable,
             .strt => try self.strt(),
@@ -8337,6 +8712,11 @@ const Cpu = struct {
             //else => unreachable,
 
         }
+        if (self.current_instr_addr >= 0x93ec and self.current_instr_addr < 0x9416) {
+            self.printRegisters();
+            std.debug.print("==================================\n", .{});
+        }
+
         switch (instr) {
             .it => {},
             else => self.psr.advanceIT(),
@@ -8352,12 +8732,200 @@ const Cpu = struct {
             self.PC += 2;
         }
     }
+
+    fn initSystick(self: *Cpu) void {
+        //const syst_csr: *SCS.Regs.SysTick.SYST_CSR = @ptrCast(&self.memory[self.translateAddress(SCS.Regs.SysTick.SYST_CSR.addr, .{}) catch unreachable]);
+        //const syst_cvr: *SCS.Regs.SysTick.SYST_CVR = @alignCast(@ptrCast(&self.memory[self.translateAddress(SCS.Regs.SysTick.SYST_CVR.addr, .{}) catch unreachable]));
+        const syst_callib: *SCS.Regs.SysTick.SYST_CALIB = @alignCast(@ptrCast(&self.memory[self.translateAddress(SCS.Regs.SysTick.SYST_CALIB.addr, .{}) catch unreachable]));
+        //const syst_rvr: *SCS.Regs.SysTick.SYST_RVR = @ptrCast(&self.memory[self.translateAddress(SCS.Regs.SysTick.SYST_RVR.addr, .{}) catch unreachable]);
+
+        syst_callib.noref = true;
+        syst_callib.skew = true;
+        //syst_cvr.current = 100;
+    }
+
+    fn sysTick(self: *Cpu) void {
+        //const ic = self.readMemMappedReg(SCS.Regs.ICSR, 0);
+        //if (ic.pendstset and !ic.pendstclr) {
+        //    try self.exceptionTaken(@intFromEnum(Exception.systick));
+        //}
+
+        const syst_csr: *SCS.Regs.SysTick.SYST_CSR = @alignCast(@ptrCast(&self.memory[self.translateAddress(SCS.Regs.SysTick.SYST_CSR.addr, .{}) catch unreachable]));
+        const syst_cvr: *SCS.Regs.SysTick.SYST_CVR = @alignCast(@ptrCast(&self.memory[self.translateAddress(SCS.Regs.SysTick.SYST_CVR.addr, .{}) catch unreachable]));
+        //const syst_callib: *SCS.Regs.SysTick.SYST_CALIB = @alignCast(@ptrCast(&self.memory[self.translateAddress(SCS.Regs.SysTick.SYST_CALIB.addr, .{}) catch unreachable]));
+        const syst_rvr: *SCS.Regs.SysTick.SYST_RVR = @alignCast(@ptrCast(&self.memory[self.translateAddress(SCS.Regs.SysTick.SYST_RVR.addr, .{}) catch unreachable]));
+
+        const icsr = self.readMemMappedReg(SCS.Regs.ICSR, 0);
+
+        //syst_rvr.reload = 100;
+
+        var tick = false;
+        const enabled = syst_csr.enable;
+
+        if (enabled) {
+            std.debug.print(".....\n", .{});
+            if (syst_cvr.current == 0) {
+                tick = true;
+                syst_csr.countflag = true;
+                if (syst_rvr.reload == 0) {
+                    syst_csr.enable = false;
+                } else {
+                    syst_cvr.current = syst_rvr.reload;
+                }
+            }
+
+            syst_cvr.current -= 1;
+
+            if (tick and enabled and syst_csr.tickint) {
+                icsr.pendstset = true;
+                icsr.pendstclr = false;
+                //try self.exceptionEntry(@intFromEnum(Exception.systick), false);
+            }
+        }
+    }
 };
 
 var cpu = Cpu{};
 
 // 32mb memory
 var mem_buf: [1024 * 1024 * 32]u8 = undefined;
+
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+
+pub fn main() !void {
+    try cpu.init(mem_buf[0..]);
+    try cpu.loadElf(elf_path);
+    cpu.initSystick();
+
+    cpu.defaultSCSRegs();
+
+    try cpu.takeReset(false);
+
+    //cpu.exception_active[2] = 1;
+    //cpu.exception_active[3] = 1;
+    //cpu.writeMemMappedReg(Cpu.SCS.Regs.SHPR1, Cpu.SCS.Regs.SHPR1{
+    //    .pri = [4]u8{0b10000000, 0, 0, 0}
+    //}, 0);
+    //cpu.exception_active[4] = 1;
+    //cpu.writeMemMappedReg(Cpu.SCS.Regs.AIRCR, Cpu.SCS.Regs.AIRCR{.prigroup = 0}, 0);
+    //const pri = cpu.getExecutionPriority();
+    //std.debug.print("getEx(): {}\n", .{pri});
+    //std.process.exit(1);
+
+    _ = try std.Thread.spawn(.{}, struct {
+        fn func() !void {
+            const w = @cImport({
+                @cInclude("windows.h");
+            });
+
+            const handle = w.GetStdHandle(w.STD_INPUT_HANDLE);
+            var mode: u32 = undefined;
+
+            if (w.GetConsoleMode(handle, &mode) != 0) {
+                mode &= @bitCast(~w.ENABLE_LINE_INPUT);
+                mode &= @bitCast(~w.ENABLE_ECHO_INPUT);
+
+                if (w.SetConsoleMode(handle, mode) == 0) {
+                    std.debug.print("Failed to set console mode.\n", .{});
+                    std.process.exit(1);
+                }
+            } else {
+                std.debug.print("Failed to get console mode.\n", .{});
+                std.process.exit(1);
+            }
+
+            while (true) {
+                const byte = try std.io.getStdIn().reader().readByte();
+                cpu.uartRXAddChar(byte);
+            }
+        }
+    }.func, .{});
+
+    const begin = std.time.milliTimestamp();
+    //while (true)
+    for (0..2000_0000) |_| {
+        var except = false;
+
+        if (cpu.fetch()) |i| {
+            if (cpu.exec(i)) |_| {} else |e| {
+                //adjust from except
+                //cpu.incrPC();
+                except = true;
+
+                switch (e) {
+                    error.ExceptionEntered => {},
+                    else => @panic("wrong error!!!"),
+                }
+            }
+        } else |e| {
+            //adjust from except
+            //cpu.incrPC();
+            //std.debug.print("===========> PC: {x}\n", .{cpu.PC});
+            //std.process.exit(1);
+            except = true;
+            switch (e) {
+                error.ExceptionEntered => {},
+                else => @panic("wrong error!!!"),
+            }
+        }
+
+        //correct pc if except
+        if (except) {
+            //cpu.incrPC();
+        }
+
+        if (cpu.uartrxint) {
+            cpu.nvicPend(0, true);
+        }
+
+        // here pc is at next instr
+        if (cpu.getPendingException()) |e| {
+            cpu.exceptionEntry(e, false, true) catch {
+                // do no
+            };
+            std.debug.print("exception: ===> {} next pc:{x}\n", .{ e, cpu.PC });
+        }
+
+        cpu.sysTick();
+
+        const aircr = cpu.readMemMappedReg(Cpu.SCS.Regs.AIRCR, 0);
+        if (aircr.sysresetreq) {
+            try cpu.takeReset(false);
+        }
+    }
+    const end = @divTrunc((std.time.milliTimestamp() - begin), 1000);
+    std.debug.print("ELAPZES: {}\n", .{end});
+}
+
+pub fn maintt() !void {
+    var args = try std.process.ArgIterator.initWithAllocator(gpa.allocator());
+    _ = args.next();
+
+    if (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "test")) {
+            if (args.next()) |arg2| {
+                try testStuff(arg2[0..]);
+            } else {
+                std.debug.print("Expects path to config!!!\n", .{});
+            }
+        }
+        return;
+    }
+
+    try cpu.init(mem_buf[0..]);
+    try cpu.loadElf(elf_path);
+
+    while (true)
+    //for (0..45) |_|
+    {
+        const i = cpu.fetch();
+        //std.debug.print("--: {}\n", .{i});
+        //std.debug.print("last in it: {}\n", .{cpu.psr.getIT().last()});
+        cpu.exec(i);
+
+        //cpu.printRegisters();
+    }
+}
 
 fn testStuff(config_path: []const u8) !void {
     std.debug.print("testing with file: {s}........\n", .{config_path});
@@ -8479,86 +9047,6 @@ fn testStuff(config_path: []const u8) !void {
 
     std.debug.print("[ok]\n", .{});
     std.process.exit(0);
-}
-
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-
-pub fn main() !void {
-    try cpu.init(mem_buf[0..]);
-    try cpu.loadElf(elf_path);
-
-    cpu.defaultSCSRegs();
-
-    try cpu.takeReset(false);
-
-    //cpu.exception_active[2] = 1;
-    //cpu.exception_active[3] = 1;
-    //cpu.writeMemMappedReg(Cpu.SCS.Regs.SHPR1, Cpu.SCS.Regs.SHPR1{
-    //    .pri = [4]u8{0b10000000, 0, 0, 0}
-    //}, 0);
-    //cpu.exception_active[4] = 1;
-    //cpu.writeMemMappedReg(Cpu.SCS.Regs.AIRCR, Cpu.SCS.Regs.AIRCR{.prigroup = 0}, 0);
-    //const pri = cpu.getExecutionPriority();
-    //std.debug.print("getEx(): {}\n", .{pri});
-    //std.process.exit(1);
-
-    const begin = std.time.milliTimestamp();
-    //while (true)
-    for (0..2000_0000) |_| {
-        if (cpu.fetch()) |i| {
-            if (cpu.exec(i)) |_| {} else |_| {
-                //adjust from except
-                cpu.incrPC();
-            }
-        } else |_| {
-            //adjust from except
-            cpu.incrPC();
-            //std.debug.print("===========> PC: {x}\n", .{cpu.PC});
-            //std.process.exit(1);
-        }
-        //std.debug.print("--: {}\n", .{i});
-        //std.debug.print("last in it: {}\n", .{cpu.psr.getIT().last()});
-
-        //cpu.printRegisters();
-
-        if (cpu.getPendingException()) |e| {
-            cpu.exceptionEntry(e, false) catch {
-                // do no
-            };
-        }
-    }
-    const end = @divTrunc((std.time.milliTimestamp() - begin), 1000);
-    std.debug.print("ELAPZES: {}\n", .{end});
-}
-
-pub fn maintt() !void {
-    var args = try std.process.ArgIterator.initWithAllocator(gpa.allocator());
-    _ = args.next();
-
-    if (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "test")) {
-            if (args.next()) |arg2| {
-                try testStuff(arg2[0..]);
-            } else {
-                std.debug.print("Expects path to config!!!\n", .{});
-            }
-        }
-        return;
-    }
-
-    try cpu.init(mem_buf[0..]);
-    try cpu.loadElf(elf_path);
-
-    while (true)
-    //for (0..45) |_|
-    {
-        const i = cpu.fetch();
-        //std.debug.print("--: {}\n", .{i});
-        //std.debug.print("last in it: {}\n", .{cpu.psr.getIT().last()});
-        cpu.exec(i);
-
-        //cpu.printRegisters();
-    }
 }
 
 pub const Instr = enum { //

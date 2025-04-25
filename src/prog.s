@@ -1,0 +1,30 @@
+.extern __stack_stop
+.extern _start
+.extern usageFaultHandler
+.extern svcHandler
+.extern memHandler
+.extern hardFaultHandler
+.extern interruptHandler
+.extern systickHandler
+
+.globl isr_vector
+.section .isr_vector, "a", %progbits
+.align 7
+.4byte __stack_stop
+.4byte _start//1
+.4byte 0//2
+.4byte hardFaultHandler//3
+.4byte memHandler//4
+.4byte 0//5
+.4byte usageFaultHandler//6
+.4byte 0//7
+.4byte 0//8
+.4byte 0//9
+.4byte 0//10
+.4byte svcHandler//11
+.4byte 0//12
+.4byte 0//13
+.4byte 0//14
+.4byte systickHandler//15
+.4byte interruptHandler//16
+.4byte 0//17
